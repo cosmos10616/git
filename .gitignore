@@ -1,0 +1,6 @@
+# 忽略一切
+/*
+# 只保留 md 文档和 claude 配置
+!/mimo深度学习交流.md
+!/.claude/
+!.gitignore
