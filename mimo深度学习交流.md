@@ -2328,6 +2328,294 @@ Rate_Matcher "缓冲区满" → ready_for_code_block=0
 
 ---
 
+## 校正：PXSCH_TX_Bit_Processing_Top 重新精读（2026-08-09）
+
+> 本节以当前 RTL 的实际连接为最高证据，校正前文中对总输出长度、固定延时、64QAM 和反压链的部分错误结论。旧内容保留，用于观察理解过程；发生冲突时以本节为准。
+
+### 1. 一句话定位
+
+`PXSCH_TX_Bit_Processing_Top` 不是单独的 Turbo 编码器，而是 PDSCH 发送侧“比特流到调制符号”的编排顶层：
+
+```text
+MAC_TX 串行 payload bit
+    → 参数查表
+    → TB/CB CRC 与码块分段
+    → Turbo 编码
+    → 速率匹配
+    → Qm 个 bit 组成一个调制字
+    → PDSCH 加扰
+    → QPSK/16QAM 映射
+    → Q2.14 复数调制符号
+
+同时：
+原始 OFDM-symbol trigger
+    → 每个触发独立延迟 ENCODE_SAFE_VALUE 个周期
+    → 送给后续资源映射模块
+```
+
+源码位置：`PXSCH_TX_Bit_Processing_Top.v:25-211`；在 `TX_BIT_Processor.v:142-157` 中例化。虽然模块名使用通用的 `PXSCH`，但本工程发送链给它的是 `PDSCH_transmitter_trigger`，所以当前用途是下行 PDSCH。
+
+### 2. 顶层端口与真正含义
+
+| 端口 | 位宽/方向 | 单位 | 当前作用 |
+|---|---:|---|---|
+| `clk_192M` | 1/input | cycle | 实际连接到 `TX_BIT_Processor.clk`，即 `clk_baseband`；频率不能只根据端口名断言 |
+| `rst_n` | 1/input | — | 低有效复位；并非所有内部延迟寄存器都接复位 |
+| `MCS_data` | 1/input | payload bit | 名字容易误导；它不是 MCS 参数，而是 MAC 输出的串行 TB 比特 |
+| `MCS_valid` | 1/input | bit-valid | `MCS_data` 当前拍是否有效 |
+| `PXSCH_transmitter_trigger` | 1/input | pulse | 启动一次配置，同时锁存本次 TB 的参数 |
+| `OFDM_symbol_trigger_in` | 1/input | pulse | 原始 OFDM 符号边界触发 |
+| `start_of_radio_frame` | 1/input | pulse | 当前只进入一段遗留延时/下降沿检测逻辑，没有影响任何顶层输出 |
+| `modulation` | 2/input | enum | `1=QPSK`、`2=16QAM`、`3=64QAM`；但当前真正实现只到 16QAM |
+| `subframe_index` | 4/input | subframe | 锁存后参与扰码 `c_init`；同时选择 `RE_NUMBER0/1` |
+| `transblock_size` | 17/input | bit/TB | 本次传输块的 payload 比特数 |
+| `delay` | 32/input | cycle | OFDM 触发的计划延迟；当前上层接 `ENCODE_SAFE_VALUE=20000` |
+| `OFDM_symbol_trigger_out` | 1/output | pulse | 延迟后的 OFDM 符号边界 |
+| `symbol_valid` | 1/output | symbol-valid | `symbol_real/imag` 当前拍有效 |
+| `ready_for_input` | 1/output | ready | 编码链是否允许 MAC 继续送 payload bit |
+| `symbol_real/imag` | 16+16/output | Q2.14 | 调制符号的实部和虚部 |
+
+### 3. 完整调用树
+
+```text
+PXSCH_TX_Bit_Processing_Top
+├── delay_1：PXSCH trigger 延迟 1 拍
+├── 参数锁存：modulation / subframe / RE number / TB size
+├── PXSCH_Channel_Encoder
+│   ├── PXSCH_Parameter_Computation：按 TB size 查编码与速率匹配参数
+│   ├── CRC_Add_and_CB_Segmentation：TB CRC、码块分段、CB CRC
+│   ├── Turbo_Encoder_Top：1/3 母码率 Turbo 编码
+│   └── TX_Rate_Matcher：交织、循环缓冲区读取和速率匹配
+├── PXSCH_Deserializer_Scrambler_Modulator
+│   ├── delay_1#(33)：等待扰码初值生成
+│   ├── Scrambler_Cinit_to_X1_X2：生成 x1/x2 初始状态
+│   ├── PXSCH_Deserializer_Bit_to_Symbol：每 Qm bit 组成一个调制字
+│   ├── PXSCH_Scrambler：与扰码序列异或
+│   └── LTE_Modulation
+│       └── Modulation：当前只有 QPSK 和 16QAM 两套有效实例
+├── Trigger_Delay_10x：实际包含 14 个并行触发延迟槽
+├── delay_n#(1,32)：最终 I/Q 再延迟 1 拍
+├── delay_1#(1)：最终 symbol_valid 再延迟 1 拍
+└── start_of_radio_frame 遗留支路：当前结果未被使用
+```
+
+### 4. 为什么 trigger 要延迟 1 拍
+
+在原始 `PXSCH_transmitter_trigger` 到达的 T0 上升沿，顶层先锁存：
+
+```verilog
+modulation_delay1   <= modulation;
+subframe_index_delay1 <= {4'd0, subframe_index};
+number_of_REs_delay1  <= (subframe_index == 0) ? RE_NUMBER0 : RE_NUMBER1;
+transblock_size_delay1 <= transblock_size;
+```
+
+同一个 trigger 又经过 `delay_1#(1)`，到 T1 才送给：
+
+- `PXSCH_Channel_Encoder.configuration_valid_in`；
+- `PXSCH_Deserializer_Scrambler_Modulator.new_control_pulse`。
+
+因此 T1 启动子模块时，T0 锁存的参数已经稳定。这一拍的作用是“配置与启动对齐”，不是把复杂组合逻辑切成一级流水。
+
+### 5. 数据路径与控制路径
+
+数据路径：
+
+```text
+MCS_data/MCS_valid
+ → PXSCH_Channel_Encoder
+ → encoding_bit_out/valid
+ → 延迟33拍并按 Qm 聚合
+ → 加扰
+ → QPSK/16QAM
+ → modulation_real/imag/valid
+ → 顶层统一延迟1拍
+ → symbol_real/imag/valid
+```
+
+控制路径：
+
+```text
+PXSCH_transmitter_trigger(T0)
+ ├→ 锁存 modulation、subframe、TB size、RE number
+ └→ delay 1
+      ├→ 启动编码参数查表
+      └→ 启动扰码初值计算
+
+OFDM_symbol_trigger_in
+ → Trigger_Delay_10x(delay=20000)
+ → OFDM_symbol_trigger_out
+```
+
+`ready_for_input` 直接来自 `PXSCH_Channel_Encoder.ready_for_data`，再反馈给 `MAC_TX.ready_for_output`。它控制的是“MAC 是否继续给编码器送 bit”，并不等同于 UDP 接收端已经获得完整的端到端反压。
+
+### 6. 编码输出长度不是动态按 RE×Qm 计算
+
+顶层确实计算并传入：
+
+```verilog
+number_of_REs_delay1 <= subframe0 ? 10800 : 15600;
+```
+
+但当前 `PXSCH_Channel_Encoder.v` 中：
+
+- `number_of_REs` 只出现在端口声明中；
+- `modulation` 只出现在端口声明中；
+- `redundancy_version_index` 也只出现在端口声明中。
+
+三者都没有进入参数计算或速率匹配实例。真正的 `E+`、`E-`、码块数 C、K、k0 等，是 `PXSCH_Parameter_Computation` 仅根据 `transport_block_size` 进行硬编码查表得到的。
+
+因此总速率匹配输出长度应计算为：
+
+```text
+G = 各码块 E 的总和
+若所有码块 E 相同：G = C × E
+调制符号数 = G ÷ Qm
+QPSK: Qm=2；16QAM: Qm=4
+```
+
+结合当前 `MCS_to_TBS` 和参数表：
+
+| 子帧 | MCS_control | 调制 | TBS | C×E = G(bit) | G/Qm(symbol) | 配置的RE | 结论 |
+|---|---:|---|---:|---:|---:|---:|---|
+| 0 | 0 | QPSK | 7224 | 2×10800=21600 | 10800 | 10800 | 闭合 |
+| 0 | 1 | QPSK | 8760 | 2×10800=21600 | 10800 | 10800 | 闭合 |
+| 0 | 2 | QPSK | 15840 | 3×7200=21600 | 10800 | 10800 | 闭合 |
+| 0 | 3 | QPSK | 8760 | 2×10800=21600 | 10800 | 10800 | 闭合 |
+| 非0 | 0 | QPSK | 10296 | 2×15600=31200 | 15600 | 15600 | 闭合 |
+| 非0 | 1 | QPSK | 15840 | 3×7200=21600 | 10800 | 15600 | **少4800个RE，需验证** |
+| 非0 | 2 | QPSK | 29296 | 5×6240=31200 | 15600 | 15600 | 闭合 |
+| 非0 | 3 | 16QAM | 30576 | 5×12480=62400 | 15600 | 15600 | 闭合 |
+
+这里暴露出一个结构问题：`TBS=15840` 同时用于“子帧0/MCS_control=2”和“非0子帧/MCS_control=1”，但参数查表只看 TBS，无法根据 RE 数区分两个场景。源码中曾注释掉 `E=10400` 的版本，即 `3×10400=31200 bit`，这恰好对应非0子帧的 15600 个 QPSK RE；当前生效值却是 `E=7200`，只对应10800个 QPSK RE。因此这一 MCS 组合不能宣称已正确填满非0子帧。
+
+### 7. 对前文 TB=30576 时序的校正
+
+前文写成了：
+
+```text
+62400 × 5
+```
+
+这是把“5个码块的总输出”又乘了一次码块数。正确关系是：
+
+```text
+C = 5
+每码块 E = 12480 bit
+G = C × E = 5 × 12480 = 62400 coded bit
+16QAM符号数 = 62400 ÷ 4 = 15600 symbol
+```
+
+所以不能再使用“最后输出约为 `30774 + 62400×5 + 37`”这一旧估算。编码、CRC、Turbo 和速率匹配之间还有流水重叠，若要得到 trigger 到首/末符号的精确周期数，必须用 testbench 记录实际握手和 valid，不能只把各段长度相加。
+
+### 8. “37周期固定延时”的校正
+
+`PXSCH_Deserializer_Scrambler_Modulator.v` 的旧注释写“延时为37”，但当前 RTL 结构是：
+
+- 输入 bit/valid 固定延迟 33 拍；
+- bit-to-symbol 要等待 Qm 个有效 bit 聚齐，因此首符号等待与 Qm 有关；
+- 加扰 valid 延迟 1 拍；
+- 当前 `LTE_Modulation` 的代码和注释均显示 4 拍；
+- 顶层最终再把 I/Q 与 valid 同步延迟 1 拍。
+
+因此不能把整个模块简单概括成“每个编码 bit 37 拍后变成 I/Q”。输入和输出的处理粒度不同：输入是一拍一个 coded bit，输出是一拍一个 modulation symbol；QPSK 每2 bit出1符号，16QAM每4 bit出1符号。精确首符号延迟应通过波形确认。
+
+### 9. 当前没有真正实现64QAM
+
+虽然多个端口和 `case` 都定义了 `QAM64=3`，而且 bit 聚合器能够收集6 bit，但 `Modulation.v` 当前只例化：
+
+- `QPSK_Modulation`；
+- `QAM16_Modulation`。
+
+`output_valid` 也只等于两者 valid 的 OR。若输入 `modulation=3`，两路 input-valid 都不会拉高，最终不会产生有效的64QAM符号。因此“枚举支持64QAM”不等于“数据通路已实现64QAM”。另外，当前上游 `CM_to_PDSCH_Encoder` 只会选择 QPSK 或16QAM，本身也不会生成3。
+
+### 10. ENCODE_SAFE_VALUE=20000 的准确含义
+
+`ENCODE_SAFE_VALUE` 并不是整个信道编码的总 latency。它只接到 `Trigger_Delay_10x.delay`，用于把每一个 `OFDM_symbol_trigger_in` 延后约20000个基带时钟周期，让编码和调制数据先跑一段时间，再启动后续资源映射的 OFDM 时间线。
+
+这里没有 `ready/valid` 握手来动态决定何时释放 OFDM trigger，所以它属于固定安全窗口。20000是否对全部 TBS/MCS 都足够，需要比较波形中的：
+
+```text
+PXSCH_transmitter_trigger
+encoding_bit_out_valid 首拍
+symbol_valid 首拍
+OFDM_symbol_trigger_out 首拍
+```
+
+若实际基带时钟确认为192 MHz，20000周期约为104.17 μs；在时钟源未核实时，只应写“20000个基带时钟周期”。
+
+### 11. Trigger_Delay_10x 的真实结构和风险
+
+模块名字及旧注释说“10个触发”，当前 RTL 实际具有：
+
+- 14位 `array/strobe/falling`；
+- 模14的触发槽索引；
+- 14个 `PULSE_TO_STROBE_U32` 实例。
+
+其用途是允许多个 OFDM 符号触发在延时窗口内同时挂起。实际代码使用 `delay_minus_2 <= delay - 3`，变量名、注释和运算值并不一致；`delay<3` 还会发生32位无符号下溢。此外，下降沿检测 `else` 后缺少 `begin/end`，只有 `falling[0]` 真正受复位分支控制，其余位每拍都会执行。再叠加公共 `delay_1/delay_n` 使用阻塞赋值，精确是否恰好延迟 D 拍必须通过仿真确认，暂不能只凭注释定论。
+
+### 12. 顶层中的遗留/无效逻辑
+
+当前源码确认：
+
+- `start_of_radio_frame` 被延迟并展宽，再检测下降沿；但检测结果 `start_of_radio_frame_delay1_strobe_falling` 没有被任何输出或控制使用；
+- `number_of_subframe_latch` 和 `number_of_subframe_out_reg` 只有声明，没有读写；
+- `number_of_REs_delay1` 虽然锁存并传入编码器，但编码器内部没有使用；
+- `last_sample_in` 被顶层固定为0，编码结束依赖 valid 数量/资源计划，而不是显式 last；
+- `subframe_index_delay1`、`number_of_REs_delay1`、`transblock_size_delay1` 没有复位分支，第一次 trigger 前仿真会是未知值；配置启动前被锁存后通常才进入有效数据路径，但仍应注意仿真可见的 X。
+
+### 13. 当前工程集成处还有“注释吞连接”问题
+
+`TX_BIT_Processor.v` 当前文本中多处本应换行的内容粘到了 `//` 注释之后，导致以下端口在 Verilog 语义上被注释掉：
+
+- `MAC_TX.MAC_trigger`；
+- `PXSCH_TX_Bit_Processing_Top.start_of_radio_frame`；
+- `PXSCH_TX_Bit_Processing_Top.OFDM_symbol_trigger_out`；
+- `PXSCH_TX_Bit_Processing_Top.symbol_valid`；
+- `PXSCH_TX_Bit_Processing_Top.symbol_real`。
+
+只有 `ready_for_input` 和 `symbol_imag` 等仍在有效代码行中。这意味着“模块本体的设计功能”和“当前 `TX_BIT_Processor` 实际集成效果”必须分开看；按当前文本直接综合/仿真，PDSCH链不会按预期工作。`PXSCH_Parameter_Computation.v` 也存在 `assign ready_for_configuration`、`sync_latch.out` 被同行注释吞掉的现象。下一步若要做系统波形，必须先确认这些文件是不是损坏副本，并恢复端口换行。
+
+### 14. 反压结论的校正
+
+能够由当前连接确认的反压链是：
+
+```text
+TX_Rate_Matcher
+ → Turbo_Encoder_Top
+ → CRC_Add_and_CB_Segmentation.ready_for_input
+ → PXSCH_Channel_Encoder.ready_for_data
+ → PXSCH_TX_Bit_Processing_Top.ready_for_input
+ → MAC_TX.ready_for_output
+```
+
+它最多证明 MAC 向编码器的 bit 输出会暂停。不能直接推出“UDP一定停写、FIFO一定不满、端到端绝不丢数据”。只有当 FIFO `full/almost_full` 真正连回 UDP 源的写使能或 ready 时，才能形成完整写侧反压。原文“每一级保证不会溢出”和“UDP停写”结论过强，应撤回。
+
+### 15. 建议的最小仿真观察点
+
+为了把本节的待验证项变成源码确认，建议只做一次最小事务并记录：
+
+```text
+PXSCH_transmitter_trigger
+modulation_delay1 / transblock_size_delay1 / subframe_index_delay1
+PXSCH_transmitter_trigger_delay1
+ready_for_input / MCS_valid / MCS_data
+encoding_bit_out_valid / encoding_bit_out
+bit_to_symbol_valid
+scrambler_valid
+modulation_valid
+symbol_valid / symbol_real / symbol_imag
+OFDM_symbol_trigger_in / OFDM_symbol_trigger_out
+```
+
+同时设置三个计数器：
+
+1. `encoding_bit_out_valid` 的总拍数，验证是否等于 G；
+2. `symbol_valid` 的总拍数，验证是否等于 G/Qm；
+3. 每个 OFDM trigger 输入到输出的周期差，验证 `Trigger_Delay_10x` 的真实延迟。
+
+---
+
 ## 待读模块
 
 - [x] 第4级: Buffer_UDP_Data (异步FIFO跨时钟域) — 2026-08-06
@@ -2339,5 +2627,5 @@ Rate_Matcher "缓冲区满" → ready_for_code_block=0
 
 ---
 
-*最后更新: 2026-08-07*
-
+---
+*最后更新: 2026-08-09*
