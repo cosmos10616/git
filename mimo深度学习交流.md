@@ -1006,7 +1006,7 @@ assign valid_out = ready_for_output && valid_in_delay98;
 | K+4 | 13 | 6148 | 加4个tail bits |
 | Kw | 15 | 18444 | 循环缓冲区大小 = 3×(K+4) |
 | E+ | 16 | 12480 | 前 C-γ-1 个码块的输出bit数 |
-| E- | 16 | 12480 | 剩余码块的输出bit数（此处E+=E-，无打孔） |
+| E- | 16 | 12480 | 剩余码块的输出bit数；`E+=E-` 只表示各码块输出长度相同，不能据此判断是否打孔 |
 | k0 | 16 | 384 | 循环缓冲区读取起始位置（RV=0时 = R×32÷?） |
 | R | 16 | 193 | 子块交织器行数 = ceil((K+4)/32) |
 
@@ -1277,8 +1277,8 @@ Turbo 码率 = 1/3: 1路系统位(d0) + 2路校验位(d1+d2)
 
 每码块输出bit: E = G / C = 62400 / 5 = 12480 (E_plus = E_minus)
 
-说明此处 E_plus = E_minus，意味着没有打孔，所有码块输出相同bit数。
-对应协议中 γ = C 的情况（所有码块都用E+）。
+**校正：** `E_plus = E_minus` 只意味着所有码块使用相同的输出长度 E，不意味着没有打孔。
+本例每码块 `Ncb=18444`、`E=12480`，所以每码块只有12480个循环缓冲区位置被选中，仍有 `18444-12480=5964` 个位置本次没有发送，属于打孔。
 ```
 
 **第五步：速率匹配起始位置 k0 (TS36.212 5.1.4.1.2)**
@@ -2616,6 +2616,362 @@ OFDM_symbol_trigger_in / OFDM_symbol_trigger_out
 
 ---
 
+## TX_Rate_Matcher 精读：被“去掉”的 bit 后来怎么办（2026-08-10）
+
+### 1. 先给结论
+
+速率匹配不是把原始 TB 数据随意删除，而是对 Turbo 编码产生的冗余 coded bit 做确定性的选择：
+
+```text
+Turbo三路输出
+→ 子块交织
+→ 收集到循环缓冲区
+→ 从k0开始读取E个bit
+```
+
+- `E < Ncb`：只读一部分位置，未读位置称为打孔（puncturing）；
+- `E = Ncb`：每个位置读取一次；
+- `E > Ncb`：读地址绕回，部分位置被重复发送（repetition）。
+
+被打孔的 coded bit 本次不经过调制和无线发送。接收端用同样的 `Ncb、k0、E` 重新生成地址，把收到的软比特写回对应位置；从未收到的位置填中性软信息 `LLR=0`，表示“这个bit取0或1的可能性一样，接收机没有证据”。Turbo 译码器再利用收到的系统位、校验位和码约束迭代推断这些缺失位置。缺失太多或信道太差时，CRC会失败。
+
+### 2. Turbo编码器原始输出
+
+每个码块经过 Turbo 编码后产生三路长度为 `D=K+4` 的序列：
+
+```text
+d0：systematic，系统位
+d1：第一个RSC编码器的校验位
+d2：第二个RSC编码器的校验位
+```
+
+母码字长度约为：
+
+```text
+Ncb = 3D = 3×(K+4)
+```
+
+系统位不是重复的原始数据副本那么简单，它还包含尾比特；d1、d2提供两套不同的卷积码约束。
+
+### 3. 子块交织在RTL中如何实现
+
+当前 `TX_Rate_Matcher.v` 没有先构造三份完整数组再进行软件式重排，而是通过写地址完成交织：
+
+```text
+data_0/d0有效时：
+  同一拍把 d0 写入 systematic RAM 的交织地址，
+  把此时的 data_1_2（d1）写入 parity RAM 的P1交织地址。
+
+data_0无效、data_1_2仍有效时：
+  data_1_2已经切换为d2，写入 parity RAM 的P2交织地址。
+```
+
+对应实例：
+
+- `Rate_Matcher_Interleaved_Address_Generator_1` 使用 `mode=01`，生成S/P1地址；
+- `Rate_Matcher_Interleaved_Address_Generator_2` 使用 `mode=10`，生成P2地址；
+- 地址发生器内部使用32列置换向量；
+- `number_of_interleaver_filler_bits` 用于跳过矩阵补齐产生的NULL位置。
+
+因此矩阵补齐的NULL并不会作为普通数据bit存进有效循环缓冲区；地址计算使用“前面已有多少填充位”的查表结果将有效地址压紧。
+
+### 4. F0的逻辑循环缓冲区
+
+`TX_Rate_Matcher_Circular_Buffer` 使用两个 Page 构成乒乓RAM：一个Page写当前码块，另一个Page读上一个码块。
+
+逻辑上缓冲区为：
+
+```text
+w[0 ... Ncb-1]
+```
+
+物理实现分成两块RAM：
+
+```text
+read_addr < number_of_systematic_bits
+    → systematic RAM
+
+read_addr >= number_of_systematic_bits
+    → parity RAM
+```
+
+这样能够一边接收下一个 Turbo 码块，一边输出当前码块的速率匹配结果。
+
+### 5. 真正完成打孔/重复的是顺序读地址
+
+`Rate_Matcher_Linear_Address_Generator.v:37-47` 使用模N计数器：
+
+```text
+address(j) = (k0 + j) mod Ncb
+j = 0, 1, ..., E-1
+```
+
+`TX_Rate_Matcher_FSM.v:168-176` 在读码块状态中连续拉高 `read_enable`，计满E拍后停止。因此发送端没有一个显式的“delete_bit”信号：
+
+- 写入缓冲区但没有被读出的地址，就是被打孔的位置；
+- 地址绕回后再次读出的地址，就是重复发送的位置。
+
+码块读完后，原RAM页后续会被下一码块覆盖；发送端不需要长期保留那些未发送bit。
+
+### 6. 一个小例子
+
+假设交织后的逻辑循环缓冲区长度为12：
+
+```text
+w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11
+```
+
+若 `k0=3、E=8`，发送地址为：
+
+```text
+3,4,5,6,7,8,9,10
+```
+
+于是 `w0、w1、w2、w11` 没有发送。接收端收到8个LLR后写回地址3到10，其他地址保持0：
+
+```text
+0 0 0 L3 L4 L5 L6 L7 L8 L9 L10 0
+```
+
+这里的0是LLR零，不是判定bit等于0，而是“完全不知道”。
+
+若同样 `Ncb=12、k0=3`，但 `E=16`，地址为：
+
+```text
+3,4,5,6,7,8,9,10,11,0,1,2,3,4,5,6
+```
+
+地址3到6被发送两次。正确的软合并应为：
+
+```text
+LLR_combined[3] = LLR_first[3] + LLR_second[3]
+```
+
+两次观测意见一致时，绝对值变大，译码置信度提高；意见相反时会相互抵消。
+
+### 7. 接收端如何做逆速率匹配
+
+当前 `RX_Rate_Matcher` 的目标流程为：
+
+```text
+解调得到E个softbit
+→ 使用和发端相同的(k0+j) mod Ncb地址写回循环缓冲区
+→ 未写位置保持LLR=0
+→ 按逆交织地址完整读出systematic和parity软信息
+→ 将合并的parity流拆回P1/P2
+→ 送Turbo Decoder
+```
+
+发端和收端无需额外传输“删掉了哪些位置”的位图，因为MCS/TBS、资源数量、RV、E和k0决定了唯一的选择序列。双方只要配置一致，就能生成相同地址。
+
+`RX_Rate_Matcher_Circular_Buffer_Page.v:45-50` 把接收softbit按线性地址重新写入systematic/parity RAM；读出一个地址后，代码还会向该地址写0，为下一次码块处理清空旧软信息。
+
+### 8. F0当前接收端的一个重要限制
+
+`RX_Rate_Matcher_Circular_Buffer_Page.v:5-11` 的注释明确写了原本计划让同一地址的多次写入进行等增益合并，但“暂时没有等增益合并”。当前RTL直接把新的 `softbit_in` 写入RAM，没有执行旧值加新值。
+
+所以当 `E>Ncb` 发生重复时：
+
+```text
+协议期望：同一地址的多次LLR相加或饱和相加
+F0当前RTL：后一次写入覆盖前一次，基本只保留最后一份观测
+```
+
+这不会让地址恢复失败，但会损失重复发送本应带来的软合并增益。第一次使用RAM时未写地址是否可靠为0，还应核对RAM IP初始化；后续正常码块流程会在读出后主动清零。
+
+### 9. HARQ与“下次再补”的关系
+
+标准系统中，重传可以更换冗余版本RV，使 `k0` 改变，从循环缓冲区的不同位置开始选择。上一次被打孔的部分coded bit可能在下一冗余版本中被发送，接收机把不同传输的LLR合并，这就是增量冗余HARQ的重要思想。
+
+但F0当前发送工程中：
+
+- `REDUNDANCY_VERSION` 固定为0；
+- `PXSCH_Channel_Encoder` 的 `redundancy_version_index` 端口没有进入实际计算；
+- `k0` 来自按TBS硬编码的参数表；
+- RX循环缓冲区当前也没有实现同地址LLR累加。
+
+因此当前工程只能按固定RV=0做单次选择，不能宣称已经实现完整的HARQ增量冗余合并。
+
+### 10. 用TB=30576验证是否打孔
+
+当前参数为：
+
+```text
+K = 6144
+D = K+4 = 6148
+Ncb = 3D = 18444
+E = 12480 bit/code-block
+k0 = 384
+```
+
+因为：
+
+```text
+E < Ncb
+12480 < 18444
+```
+
+所以每个码块确定发生打孔：
+
+```text
+每码块未发送位置数 = Ncb-E = 5964
+```
+
+`E_plus=E_minus=12480` 只表示5个码块都各输出12480 bit。整个TB的速率匹配输出仍为：
+
+```text
+G = 5×12480 = 62400 coded bit
+```
+
+它与16QAM资源闭合：
+
+```text
+62400 bit ÷ 4 bit/symbol = 15600 modulation symbol
+```
+
+---
+
+## MIMO 工程第一遍通读地图（2026-08-10）
+
+这一遍只建立坐标，不在 Turbo、速率匹配、信道估计、MMSE/QR 等深层算法里停留。每看到一个模块，先回答四个问题：它属于 TX 还是 RX、处理什么数据粒度、由什么触发、把结果交给谁。
+
+### 1. 两级总入口
+
+```text
+MIMO_Project_Config
+  └─ 板级外壳：时钟、复位、Aurora、UDP、射频接口、调试信号
+      └─ MIMO_Project_Top
+          ├─ MIMO_TX_Top
+          ├─ MIMO_RX_Top
+          └─ FIFO_Manager：组织算法模块和跨 FPGA/Aurora 的数据交换
+```
+
+Vivado 工程的综合顶层是 `MIMO_Project_Config`；真正的收发算法入口是其内部的 `MIMO_Project_Top`。因此不能把 `TX_BIT_Processor` 当成整个工程顶层，它只是发送链前半段的一条 layer 处理链。
+
+### 2. TX 主链
+
+```text
+UDP payload
+ → 3× TX_BIT_Processor
+ → TX_BIT_FIFO_Exchange
+ → FIFO_Manager / Aurora 交换
+ → TX_MIMO_Processor
+ → TX_RRH_FIFO_Exchange
+ → TX_RRH_Processor
+ → Over_Sample_Group
+ → DAC / RF
+```
+
+其中 `TX_BIT_Processor` 内部又可压缩为：
+
+```text
+UDP字节 → MAC组TB → CRC/Turbo/速率匹配
+        → PXSCH_Deserializer_Scrambler_Modulator
+        → 资源映射/变换 → 复数基带流
+```
+
+`PXSCH_Deserializer_Scrambler_Modulator` 属于数据路径：把串行 coded bit 按 Qm 聚合、加扰并映射为 Q2.14 的 I/Q 调制符号。`Trigger_Delay_10x` 属于并行的控制路径：把每个 OFDM-symbol trigger 延迟固定安全窗口，再交给后续资源映射时间线。
+
+### 3. RX 主链
+
+```text
+ADC / 8路本地天线复数流
+ → RX_RRH_Processor
+ → RX_RRH_FIFO_Exchange
+ → FIFO_Manager / Aurora 交换
+ → RX_MIMO_Processor
+ → RX_MIMO_Data_Processing
+ → RX_BIT_Processor_Top
+ → 3× RX_BIT_Processor
+ → CRC结果与用户数据
+```
+
+`RX_MIMO_Processor` 是接收侧数学核心，主路径为资源解映射、信道估计、MMSE 权重计算和信道均衡；`RX_BIT_Processor` 再执行软解调、解扰、逆速率匹配、Turbo 译码和 CRC 检查。
+
+### 4. 第一遍建议顺序
+
+```text
+MIMO_Project_Config
+ → MIMO_Project_Top
+ → MIMO_TX_Top
+ → TX_BIT_Processor（已学到这里）
+ → TX_MIMO_Processor
+ → TX_RRH_Processor
+ → MIMO_RX_Top
+ → RX_RRH_Processor
+ → RX_MIMO_Processor
+ → RX_BIT_Processor_Top
+```
+
+第一遍结束后再集中精读四组难点：
+
+1. 时频资源：`TTI_Handing_Top`、`Combine_Control_and_Data`、`Resource_Demapper`；
+2. 信道编码：Turbo、TX/RX Rate Matcher；
+3. MIMO 数学：Channel Estimation、MMSE、QR、矩阵求逆、Equalizer；
+4. 分布式数据组织：各种 FIFO Exchange、`FIFO_Manager`、RRH 收发链。
+
+---
+
+## Gold 序列与 PDSCH 加扰（2026-08-10）
+
+### 1. Gold 序列是什么
+
+LTE 使用两条31级 m 序列异或得到伪随机 Gold 序列：
+
+```text
+x1(n+31)=x1(n+3)⊕x1(n)
+x2(n+31)=x2(n+3)⊕x2(n+2)⊕x2(n+1)⊕x2(n)
+c(n)=x1(n+1600)⊕x2(n+1600)
+```
+
+`x1(0)=1、x1(1..30)=0`；`x2(0..30)` 由 `c_init` 给定。它外观近似随机，但只要初值相同就完全可重复，不是密码学随机数。
+
+### 2. Gold 序列在当前 RTL 中的体现
+
+```text
+new_control_pulse
+ → c_init = cell_ID | (RNTI<<14) | (subframe_index<<9)
+ → Scrambler_Cinit_to_X1_X2
+ → x1_initial_value / x2_initial_value
+ → PXSCH_Scrambler中的两个32位状态寄存器
+```
+
+当前工程相当于取PDSCH公式中的码字索引 `q=0`。`x1_initial_value=0x5E485840` 正是将 `x1(1600..1631)` 按低位优先打包的结果；`x2` 则利用 `ROM_for_scrambler_X2` 把 `c_init` 直接变换成跳过1600步后的32位状态，不必运行时逐拍空转1600次。
+
+### 3. 发送端怎样加扰
+
+`Scrambler.v` 的核心为：
+
+```verilog
+xor_result = data_in ^ x1_state[7:0] ^ x2_state[7:0];
+```
+
+令 `c_vec=x1_state⊕x2_state`，则每个有效 coded bit 执行 `b_tilde=b⊕c`。QPSK每次使用状态低2位，16QAM使用低4位；随后 `Scrambler_Process_X1/X2` 一次把状态推进2或4步。只有 `valid_in=1` 才真正更新状态，所以数据空洞不会误消耗扰码bit。
+
+例如 `b=1101、c=1011`，发送为 `b_tilde=0110`；接收端再异或同一 `c`，因 `c⊕c=0`，恢复为 `1101`。
+
+### 4. 接收端如何解扰
+
+解调器输出的是LLR软信息，不能简单当硬bit异或。`Scrambler_Softbit.v` 对每个Gold bit执行：
+
+```text
+c=0：LLR保持
+c=1：LLR取相反数
+```
+
+`Negate_Saturate` 还把8位有符号数 `-128` 的相反数饱和为 `+127`，防止溢出。发收两端必须使用相同的RNTI、cell ID、子帧号、码字索引和bit顺序，否则解扰后近似随机，Turbo译码通常失败。
+
+### 5. 加扰不等于主动干扰
+
+```text
+加扰：发送机内部在调制前做 b_tilde=b⊕c；接收机知道c，可逆；不增加射频能量。
+主动干扰：另一个信号源向信道注入额外波形，接收为 y=h·s+j+n；通常未知且不可直接异或消除。
+```
+
+加扰用于数据白化、区分用户/小区/码字并降低序列相关性；它不是加密，也不是攻击手段。主动干扰的目的或效果是降低SINR、破坏同步或增加误码，两者只是在波形上都可能“看起来像噪声”，数学位置和工程目的完全不同。
+
+---
+
 ## 待读模块
 
 - [x] 第4级: Buffer_UDP_Data (异步FIFO跨时钟域) — 2026-08-06
@@ -2628,4 +2984,4 @@ OFDM_symbol_trigger_in / OFDM_symbol_trigger_out
 ---
 
 ---
-*最后更新: 2026-08-09*
+*最后更新: 2026-08-10*
