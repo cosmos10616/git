@@ -2357,73 +2357,432 @@ PULSE_TO_STROBE_U16 生成 index 从 0 到 30，每个index读一次ROM，做一
 
 ##### 6b-2. PXSCH_Deserializer_Bit_to_Symbol — 串行bit拼成并行符号
 
-**解决的问题：** Turbo编码输出是1bit/cycle的串行流，但调制器需要2/4/6bit一组的符号。
+**先把“符号”说准确：** 这里输出的 `symbol_out[5:0]` 还不是OFDM符号，也不是I/Q复数调制符号。它只是把连续的Qm个coded bit打包成一个“星座点标签”。真正的Gold加扰和QPSK/16QAM星座映射在后面完成。
 
-**核心算法——逐bit修改法：**
+```text
+速率匹配后的串行coded bit
+    → 本模块：每Qm个bit打成一个并行标签
+    → PXSCH_Scrambler：与Qm个Gold bit异或
+    → LTE_Modulation：标签映射成I/Q
+```
 
-不是用移位寄存器等待凑够，而是维护一个"当前符号"，每次修改其中一位：
+`bits_per_symbol` 由上层根据调制方式设置：
+
+| 调制方式 | `bits_per_symbol=Qm` | 本模块每收到多少个有效bit输出一次 |
+|---|---:|---:|
+| QPSK | 2 | 2个 |
+| 16QAM | 4 | 4个 |
+| 64QAM枚举 | 6 | 6个；但当前后级没有真正的64QAM调制器 |
+
+**一、真正负责组装的变量**
+
+| 信号/寄存器 | 实际含义 |
+|---|---|
+| `symbol_out_next[5:0]` | 组装桶：保存已经收到、但尚未凑满Qm个的bit |
+| `bit_index[2:0]` | 当前输入bit应该写入组装桶的哪一位；从0开始 |
+| `bit_index_add1` | `bit_index+1`的提前量，也等于加入当前bit后的累计bit数 |
+| `symbol_out_current` | 把当前 `bit_in` 写入组装桶之后得到的组合逻辑新值 |
+| `stop` | 当前bit加入后已经凑满Qm个，或者当前bit被标记为最后一个 |
+| `symbol_out_reg` | 输出寄存器；在当前上升沿保存 `symbol_out_current` |
+| `valid_out_reg` | 只有当前组已经结束时才拉高，说明 `symbol_out_reg` 可以使用 |
+
+`symbol_out_next` 名字容易误导。它不是“下一个要输出的完整符号”，而是**当前正在拼装的半成品寄存器**。
+
+**二、一个输入bit怎样写入指定位置**
+
+当前RTL没有写成 `symbol_out_next[bit_index] <= bit_in`，而是先比较，再用异或翻转指定位置：
 
 ```verilog
-// symbol_out_next = 当前正在构建的符号
-// bit_index = 当前要修改第几位 (0→2, 0→4, 0→6)
-
-// 检查：要修改的bit和当前符号中的对应bit是否相同？
 change_flag = (symbol_out_next[bit_index] != bit_in);
 
-// 如果不同，翻转该位
-symbol_out_current = change_flag ? (symbol_out_next ^ (6'd1 << bit_index)) : symbol_out_next;
-
-// 凑够了或最后一bit？
-stop = (bit_index_add1 == bits_per_symbol) | last_sample_in;
-
-// 凑够了→输出，归零。没凑够→继续。
-symbol_out_next <= stop ? 6'd0 : symbol_out_current;
-valid_out_reg <= stop & valid_in;
+symbol_out_current = change_flag
+                   ? symbol_out_next ^ (6'd1 << bit_index)
+                   : symbol_out_next;
 ```
 
-举个例子（QPSK，bits_per_symbol=2）：
-```
-bit_in: 1, 0, 1, 1, 0, 0, ...
-        ↓  ↓  ↓  ↓  ↓  ↓
-cycle1: idx=0, sym=0→bit0翻1→sym=01, stop=0 (idx+1=1≠2)
-cycle2: idx=1, sym=01→bit1翻0→sym=01, stop=1 (idx+1=2=2) → 输出01, sym归0
-cycle3: idx=0, sym=0→bit0翻1→sym=01, stop=0
-cycle4: idx=1, sym=01→bit1翻1→sym=11, stop=1 → 输出11, sym归0
-cycle5: ...
+`6'd1 << bit_index` 是一个只有目标位为1的one-hot掩码：
+
+```text
+bit_index=0 → 000001
+bit_index=1 → 000010
+bit_index=2 → 000100
+bit_index=3 → 001000
 ```
 
-这个设计的优雅之处：不需要移位寄存器，只需要1个6-bit寄存器 + 1个3-bit索引，每个周期只修改1个bit。
+如果旧值和 `bit_in` 不同，就与掩码异或，目标位被翻转；如果相同，就保持不变。最终效果等价于：
+
+```text
+symbol_out_current[bit_index] = bit_in
+其他位置保持原值
+```
+
+也可以把它理解成下面更直观的公式：
+
+```verilog
+mask = 6'd1 << bit_index;
+new_symbol = (old_symbol & ~mask) | (({5'd0,bit_in}) << bit_index);
+```
+
+**三、为什么用 `bit_index_add1 == bits_per_symbol` 判断结束**
+
+复位后：
+
+```text
+bit_index      = 0
+bit_index_add1 = 1
+```
+
+当前bit写入的位置是 `bit_index`，加入当前bit后的数量是 `bit_index_add1`。因此：
+
+```verilog
+stop = last_sample_out_temp
+     | (bit_index_add1 == bits_per_symbol);
+```
+
+以16QAM为例：
+
+| 当前写入位置 | 加入后已有bit数 `bit_index_add1` | 是否等于Qm=4 |
+|---:|---:|---|
+| 0 | 1 | 否 |
+| 1 | 2 | 否 |
+| 2 | 3 | 否 |
+| 3 | 4 | 是，当前组结束 |
+
+所以不会出现“写到第4位以后还要再等一拍”的问题：写入 `bit_index=3` 的同一个上升沿，完整4-bit标签就进入输出寄存器，`valid_out` 同时变成1。
+
+**四、三个时序always块怎样协作**
+
+当 `valid_in=1` 时，同一个时钟上升沿完成三件事：
+
+```text
+1. 输出寄存器保存：symbol_out_reg ← symbol_out_current
+
+2. 如果stop=0：
+      symbol_out_next ← symbol_out_current
+      bit_index       ← bit_index+1
+   如果stop=1：
+      symbol_out_next ← 0
+      bit_index       ← 0
+
+3. valid_out_reg ← stop
+```
+
+这里有一个很容易误解的点：`symbol_out_reg` 每拍都可能保存半成品，但下游只有在 `valid_out=1` 时才允许读取它。因此前几拍输出总线上的数值即使发生变化，也不代表已经产生了一个有效调制标签。
+
+当 `valid_in=0` 时：
+
+```text
+symbol_out_next、bit_index保持不变
+valid_out=0
+```
+
+所以输入bit之间可以有空拍。本模块统计的是“有效bit数量”，不是连续时钟数量。
+
+**五、QPSK逐周期例子**
+
+假设 `bits_per_symbol=2`，输入的有效bit依次是：
+
+```text
+b0=1，b1=0，b2=1，b3=1
+```
+
+| 有效输入拍 | `bit_in` | 写入位置 | 写入后的 `symbol_out_current` | `stop` | 上升沿后的有效输出 |
+|---:|---:|---:|---:|---:|---|
+| 1 | 1 | bit0 | `000001` | 0 | 无，`valid_out=0` |
+| 2 | 0 | bit1 | `000001` | 1 | `symbol_out[1:0]=01` |
+| 3 | 1 | bit0 | `000001` | 0 | 无，`valid_out=0` |
+| 4 | 1 | bit1 | `000011` | 1 | `symbol_out[1:0]=11` |
+
+第一个串行bit写入bit0，第二个串行bit写入bit1。因此串行顺序：
+
+```text
+先收到 b0，再收到 b1
+```
+
+形成的Verilog向量是：
+
+```text
+symbol_out[1:0] = {b1,b0}
+```
+
+这不是把时间顺序反转了，而是Verilog显示总线时总把高位写在左边；最先收到的bit确实保存在最低位bit0。
+
+**六、16QAM逐周期例子**
+
+假设4个有效输入bit依次是 `1、0、1、1`：
+
+| 有效输入拍 | 写入位置 | 组装桶的新值 | 是否输出 |
+|---:|---:|---:|---|
+| 1 | bit0=1 | `000001` | 否 |
+| 2 | bit1=0 | `000001` | 否 |
+| 3 | bit2=1 | `000101` | 否 |
+| 4 | bit3=1 | `001101` | 是，`symbol_out[3:0]=1101` |
+
+随后模块立即把 `symbol_out_next` 和索引清零，从下一个有效bit开始组装下一组16QAM标签。
+
+**七、它与后级bit重排的关系**
+
+本模块只按到达顺序完成：
+
+```text
+第1个bit→symbol[0]
+第2个bit→symbol[1]
+第3个bit→symbol[2]
+第4个bit→symbol[3]
+```
+
+它不决定哪个bit控制I、哪个bit控制Q，也不在这里完成Gray映射。后面的 `Map_LTE_to_Common_Modulation_Symbol` 才会取反并重排。例如16QAM当前代码执行：
+
+```verilog
+out[3:0] = {~in[3], ~in[1], ~in[2], ~in[0]};
+```
+
+因此学习时要把两件事分开：
+
+```text
+Bit_to_Symbol：只负责按时间顺序凑齐Qm个bit
+LTE Mapping：负责按照LTE星座定义调整这些bit的意义和位置
+```
+
+**八、当前工程中的 `last_sample_in`**
+
+模块本身允许：
+
+```verilog
+last_sample_out_temp = last_sample_in & valid_in;
+```
+
+即使没有凑满Qm个bit，`last_sample_in=1` 也能强制结束当前组。但当前 `PXSCH_TX_Bit_Processing_Top` 中把该端口直接连接为：
+
+```verilog
+.last_sample_in(1'b0)
+```
+
+所以当前工程实际不会使用“末bit强制结束”功能，只能依靠 `bit_index_add1 == bits_per_symbol` 结束。也就是说速率匹配输出总长度G必须能够被Qm整除；当前有效配置按设计应满足：
+
+```text
+QPSK：G mod 2 = 0
+16QAM：G mod 4 = 0
+```
+
+本模块没有输出ready，也没有内部输出FIFO。它假设后级可以接收每次产生的标签；连续输入时，QPSK每2个时钟产生一个有效标签，16QAM每4个时钟产生一个有效标签。
 
 ---
 
 ##### 6b-3. PXSCH_Scrambler — Gold序列加扰
 
-**解决的问题：** 对每个调制符号的bit做随机化（加扰），避免长串的0或1导致频谱不平坦。
+**先给结论：每一个有效coded bit都要加扰。** 数学上第n个bit执行：
 
-**本质** = 调制符号 ⊕ Gold序列的低 N 位。
-
-```verilog
-// 组合逻辑 Scrambler（无延迟）:
-xor_result = data_in ^ x1_state[7:0] ^ x2_state[7:0];  // 8-bit异或
-// 根据调制方式截断高位
-data_out = xor_result & bit_mask;  // QPSK保留低2位，16QAM保留低4位，64QAM保留低6位
+```text
+发送端：b_tilde(n) = b(n) XOR c(n)
 ```
 
-**x1/x2状态更新（关键：每次消耗N步）：**
+其中 `b(n)` 是速率匹配后的coded bit，`c(n)` 是Gold加扰序列的第n个bit。只是当前RTL已经先用 `Bit_to_Symbol` 把Qm个bit并在一起，所以硬件不是一拍只异或一个bit，而是一拍并行处理当前标签中的Qm个bit：
 
-x1和x2都是31阶LFSR（线性反馈移位寄存器）。正常每周期递进1步。但这里每个符号消耗 N 个bit的Gold序列（QPSK=2, 16QAM=4, 64QAM=6），所以 x1/x2 要一次性递进 N 步。
+```text
+QPSK ：一次并行加扰2个bit，使用c(n)、c(n+1)
+16QAM：一次并行加扰4个bit，使用c(n)到c(n+3)
+64QAM枚举：一次并行处理6个bit，但当前后级没有真正实现64QAM调制
+```
 
-`Scrambler_Process_X1` 和 `Scrambler_Process_X2` 是组合逻辑，输入当前状态 + 递进步数，输出递进后的状态。没有时钟延迟。
+因此“每个bit都加扰”和“RTL一次处理Qm个bit”并不矛盾：前者是算法粒度，后者是硬件并行度。
 
-**状态更新逻辑：**
+**一、`c(n)`究竟是什么**
+
+Gold序列由两个31阶伪随机序列逐bit异或得到：
+
+```text
+c(n) = x1(n+Nc) XOR x2(n+Nc)
+```
+
+当前RTL已经把跳过 `Nc=1600` 后的状态预先计算成初始状态，所以工作时可以直接使用：
+
+```verilog
+c_vector = x1_state ^ x2_state;
+```
+
+这里要严格区分两个容易混淆的名字：
+
+| 名称 | 含义 |
+|---|---|
+| `c_init` / `c_initial_value` | 生成x2初始状态所使用的32-bit种子 |
+| `c(n)` | 最终Gold序列中的第n个1-bit加扰值 |
+
+可以把它们类比成：
+
+```text
+c_init = 生成序列的配方/种子
+c(n)   = 按配方生成出来的第n个0或1
+```
+
+当前发送端的种子计算为：
+
+```verilog
+c_init = cell_ID
+       | (RNTI << 14)
+       | (subframe_index << 9);
+```
+
+`x1`初始状态固定，`x2`初始状态由 `c_init` 计算。因此不同用户RNTI、不同小区ID或不同子帧号通常会生成不同的 `c(n)` 序列。
+
+**二、发送端RTL怎样对Qm个bit并行加扰**
+
+`Scrambler.v` 的核心只有一条异或：
+
+```verilog
+xor_result = data_in ^ x1_state[7:0] ^ x2_state[7:0];
+```
+
+逐位展开就是：
+
+```text
+data_out[0] = data_in[0] XOR x1_state[0] XOR x2_state[0]
+            = b(n) XOR c(n)
+
+data_out[1] = data_in[1] XOR x1_state[1] XOR x2_state[1]
+            = b(n+1) XOR c(n+1)
+
+data_out[2] = b(n+2) XOR c(n+2)
+...
+```
+
+然后根据调制方式只保留低Qm位：
+
+```verilog
+QPSK : data_out = {6'd0, xor_result[1:0]};
+16QAM: data_out = {4'd0, xor_result[3:0]};
+QAM64: data_out = {2'd0, xor_result[5:0]};
+```
+
+例如QPSK当前标签为：
+
+```text
+b = [b1,b0] = 2'b10
+c = [c1,c0] = 2'b11
+```
+
+发送端输出：
+
+```text
+b_tilde = b XOR c
+        = 10 XOR 11
+        = 01
+```
+
+原始标签 `10` 因此变成加扰标签 `01`，后者才进入星座映射。
+
+**三、Gold状态什么时候向前推进**
+
+每成功处理一个有效并行标签，x1和x2要向前推进Qm步：
+
+```text
+QPSK有效一次  → 消耗2个c(n)，状态推进2步
+16QAM有效一次 → 消耗4个c(n)，状态推进4步
+```
+
+状态更新逻辑为：
+
 ```verilog
 if(scrambler_initialization_valid)
-    x1_state_reg <= x1_initial_value;  // 加载新初始值（新子帧开始）
+    x1_state_reg <= x1_initial_value;
 else if(valid_in)
-    x1_state_reg <= x1_state_out;      // 递进N步
+    x1_state_reg <= x1_state_out;
 else
-    x1_state_reg <= x1_state_reg;      // 保持
+    x1_state_reg <= x1_state_reg;
 ```
+
+所以空拍不会消耗Gold bit。只有 `valid_in=1`、真正处理了一个调制标签时，序列位置才前进Qm位。这保证有空拍时，发送数据与 `c(n)` 的编号仍然连续对应。
+
+**四、接收端为什么也需要 `c(n)`**
+
+因为异或同一个bit两次会恢复原值：
+
+```text
+0 XOR 0 = 0
+1 XOR 0 = 1
+0 XOR 1 = 1
+1 XOR 1 = 0
+
+c(n) XOR c(n) = 0
+```
+
+若暂时按硬判决bit理解：
+
+```text
+发送：b_tilde(n) = b(n) XOR c(n)
+
+接收：b_hat(n) = b_tilde(n) XOR c(n)
+                 = b(n) XOR c(n) XOR c(n)
+                 = b(n)
+```
+
+举例：
+
+```text
+原始b：  1 0 1 1
+Gold c： 0 1 1 0
+发送值： 1 1 0 1
+接收再异或同一个c：
+          1 0 1 1
+```
+
+接收端不是从空口额外接收 `c(n)`。它使用和发送端相同的：
+
+```text
+cell_ID
+RNTI
+subframe_index
+调制方式Qm
+事务起点
+```
+
+重新计算相同的 `c_init`，生成相同的x1/x2状态，并按同样节奏产生同一条 `c(n)`。
+
+**五、当前接收端处理的是LLR，不是硬bit**
+
+解调器输出的是软信息LLR。对于发送端的：
+
+```text
+b_tilde = b XOR c
+```
+
+接收端的等价软解扰操作为：
+
+```text
+c=0：LLR保持不变
+c=1：LLR取相反数
+```
+
+当前 `Scrambler_Softbit.v` 直接生成：
+
+```verilog
+scrambler_control = x1_state_in ^ x2_state_in;
+```
+
+再让6个 `Negate_Saturate` 分别处理每一个可能的softbit：
+
+```verilog
+softbit_out = scramble ? -softbit_in : softbit_in;
+```
+
+其中输入为8-bit有符号数。对最小值 `-128` 不能普通取负，因为8-bit中没有 `+128`，模块将它饱和到 `+127`。
+
+**六、发送端和接收端的c不同步会怎样**
+
+如果双方任一项不一致：
+
+```text
+RNTI不同
+cell_ID不同
+subframe_index不同
+Qm不同
+起始时刻错一组
+中途多消耗或少消耗一个Gold bit
+```
+
+接收端生成的就不是发送端使用的同一条 `c(n)`。此时LLR会被错误地翻转，后续逆速率匹配和Turbo译码看到的是大量错误软信息，最终通常表现为CRC失败。
+
+因此接收端“也有c”的准确说法是：**接收端具有一个与发送端同步、参数相同的Gold序列发生器，用它撤销发送端的确定性异或。c不是秘密，也不需要随数据发送。**
 
 ---
 
@@ -2739,35 +3098,415 @@ delay<3时无符号下溢
 
 ### 实现功能
 
-把 `TTI_Handing_Top` 生成的控制消息转换为PDCCH调制符号，供后续资源映射与PDSCH复用。
+把 `TTI_Handing_Top` 生成的112-bit控制消息 `CM_message` 转换成3600个QPSK复数符号，提前写入PDCCH符号FIFO，等待资源映射器在子帧0的 `symbol_index=8` 取出。
+
+第一遍通读只需要先记住这一张图：
+
+```mermaid
+flowchart LR
+    TTI["TTI_Handing_Top<br/>产生112-bit CM_message"]
+    PDCCH["PDCCH_Transmitter_Top<br/>串行化、编码、加扰、QPSK"]
+    FIFO["PDCCH symbol FIFO<br/>缓存3600个I/Q符号"]
+    MAP["Resource Mapper<br/>子帧0、符号8读取"]
+    IFFT["DC插入 / WFRFT / IFFT后续链"]
+
+    TTI --> PDCCH --> FIFO --> MAP --> IFFT
+```
+
+这个模块只负责“提前生产PDCCH符号”，不决定它们最终放到资源网格的哪个位置。真正的位置选择发生在后面的 `Combine_Control_and_Data → TX_Resource_Mapper_Top`。
+
+关键顶层端口：
+
+| 端口 | 方向/位宽 | 来源或去向 | 实际含义 |
+|---|---:|---|---|
+| `clk` | input/1 | 基带时钟 | 整条控制信道处理时钟 |
+| `rst_n` | input/1 | 系统复位 | 低有效复位 |
+| `PDCCH_trigger` | input/1 | `TTI_Handing_Top` | 每个无线帧开始时启动一次控制消息编码 |
+| `CM_message` | input/112 | `TTI_Handing_Top` | 当前无线帧的帧计数、子帧数、MCS数组及保留位 |
+| `symbol_valid` | output/1 | `Combine_Control_and_Data` | 当前输出I/Q是一个有效PDCCH调制符号 |
+| `symbol_real` | output/16 | PDCCH符号FIFO | Q2.14格式实部 |
+| `symbol_imag` | output/16 | PDCCH符号FIFO | Q2.14格式虚部 |
 
 ### 实现原理解读
 
-```text
-CM_message
- → CM_to_Stream：控制消息串行化
- → PDCCH_TX_Bit_Processing：控制信道编码、加扰、调制
- → PDCCH I/Q symbol
+#### 1. 112-bit控制消息从哪里来
+
+`TTI_Handing_Top` 构造：
+
+```verilog
+CM_message <= {counter, CM_latch, 24'd0};
 ```
+
+其字段布局为：
+
+```text
+bit 111                       bit 0
+┌──────────────┬──────┬──────────────────┬──────────────┐
+│ frame counter│  10  │    MCS_array     │   reserved   │
+│   24 bit     │ 4 bit│      60 bit      │    24 bit    │
+└──────────────┴──────┴──────────────────┴──────────────┘
+ [111:88]       [87:84] [83:24]           [23:0]
+```
+
+含义：
+
+| 字段 | 位段 | 含义 |
+|---|---|---|
+| `counter` | `[111:88]` | 无线帧计数器 |
+| `4'd10` | `[87:84]` | 一个无线帧包含10个子帧 |
+| `MCS_array` | `[83:24]` | 10个子帧使用的MCS控制信息 |
+| `24'd0` | `[23:0]` | 当前保留位 |
+
+#### 2. 数据流和控制流不是同一条线
+
+```mermaid
+flowchart TB
+    TRIG["PDCCH_trigger"] --> D1["顶层delay 1拍"]
+    D1 --> PROC["PDCCH_TX_Bit_Processing"]
+    PROC --> D2["内部再delay 1拍"]
+    D2 --> CONFIG["启动PXSCH_Channel_Encoder配置"]
+    D2 --> GOLD["启动Gold序列初始化"]
+
+    CONFIG --> READY["ready_for_data拉高"]
+    READY -->|"反馈"| SER["CM_to_Stream开始发送112个bit"]
+    CM["CM_message[111:0]"] --> SER
+    SER --> ENC["CRC + Turbo + Rate Matching"]
+    ENC --> SCR["bit分组 + 加扰 + QPSK"]
+    SCR --> IQ["symbol_valid / real / imag"]
+```
+
+最容易看错的一点是：
+
+```text
+PDCCH_trigger并不直接启动CM_to_Stream。
+```
+
+真实顺序为：
+
+```text
+PDCCH_trigger
+→ 启动编码器配置
+→ 编码器完成参数准备并进入可收数据状态
+→ ready_for_input出现上升沿
+→ CM_to_Stream才开始串行发送112个bit
+```
+
+这样做的目的，是确保编码器准备好以后，控制消息才开始送入，不会在参数尚未就绪时丢掉前几个bit。
+
+#### 3. 112 bit怎样变成3600个QPSK符号
+
+这是本模块最重要的数量关系：
+
+```mermaid
+flowchart LR
+    A["CM原始消息<br/>112 bit"]
+    B["添加TB CRC24<br/>K=136 bit"]
+    C["Turbo母码<br/>D=K+4=140<br/>Ncb=3D=420 bit"]
+    D["速率匹配重复读取<br/>E=7200 bit"]
+    E["QPSK分组<br/>2 bit/symbol"]
+    F["3600个复数符号<br/>填满1个有效OFDM符号"]
+
+    A --> B --> C --> D --> E --> F
+```
+
+`PXSCH_Parameter_Computation` 对 `TBS=112` 的固定查表结果：
+
+| 参数 | 值 | 含义 |
+|---|---:|---|
+| `C` | 1 | 只有一个码块 |
+| `K` | 136 | 112个信息bit加24-bit TB CRC |
+| `D` | 140 | `K+4`，包含Turbo尾比特 |
+| `Ncb` | 420 | `3×D`，Turbo三路母码字大小 |
+| `E` | 7200 | 速率匹配最终输出长度 |
+| `k0` | 8 | 循环缓冲区读取起点 |
+| `Qm` | 2 | 固定QPSK |
+
+因为：
+
+```text
+E = 7200 > Ncb = 420
+```
+
+所以这里不是打孔，而是大量重复读取循环缓冲区。平均每个母码bit被发送约：
+
+```text
+7200 / 420 ≈ 17.14 次
+```
+
+最后：
+
+```text
+7200 coded bit / 2 bit每QPSK符号 = 3600个QPSK符号
+```
+
+而当前工程每个OFDM符号恰好有3600个有效子载波，所以数量完全闭合。
+
+#### 4. 为什么需要PDCCH符号FIFO
+
+PDCCH在无线帧开始时就启动编码，但资源网格不是立刻使用它。当前映射位置是子帧0的第9个OFDM符号，即 `symbol_index=8`。
+
+```mermaid
+sequenceDiagram
+    participant TTI as TTI/无线帧时序
+    participant ENC as PDCCH编码链
+    participant FIFO as PDCCH符号FIFO
+    participant MAP as 资源映射器
+
+    TTI->>ENC: 无线帧开始，PDCCH_trigger
+    ENC->>ENC: 112bit串行化、CRC、Turbo、速率匹配、QPSK
+    ENC->>FIFO: symbol_valid期间写入3600个I/Q符号
+    Note over FIFO: 编码结果提前缓存
+    TTI->>MAP: 到达subframe=0、symbol=8
+    MAP->>FIFO: CM_flag持续3600个有效子载波拍
+    FIFO-->>MAP: 依次输出3600个PDCCH符号
+```
+
+因此生产和消费是解耦的：
+
+```text
+PDCCH编码器决定“符号什么时候算好”；
+Resource Mapper决定“符号什么时候放上资源网格”。
+```
+
+#### 5. 它不是标准LTE PDCCH实现
+
+当前模块虽然命名为PDCCH，但实际实现是工程自定义控制信道：
+
+| 对比项 | 标准LTE PDCCH | 当前F0工程 |
+|---|---|---|
+| 输入格式 | DCI格式 | 自定义112-bit `CM_message` |
+| 信道编码 | 尾咬合卷积码 | 复用 `PXSCH_Channel_Encoder` 的Turbo编码链 |
+| 资源组织 | CCE/REG结构 | 固定生成3600个QPSK符号 |
+| 所在位置 | 通常位于子帧前几个符号 | 当前固定为子帧0的 `symbol_index=8` |
+| 发送频率 | 按调度需求/子帧 | 当前每个无线帧启动一次 |
+
+因此学习时应把它理解为：
+
+```text
+“借用PDCCH名称的自定义系统控制消息通道”
+```
+
+而不是严格照搬3GPP LTE PDCCH。
 
 ### 子模块关系图
 
-```text
-PDCCH_Transmitter_Top
-├─ delay_1：PDCCH trigger对齐
-├─ CM_to_Stream
-└─ PDCCH_TX_Bit_Processing
-   └─ 复用PXSCH_Deserializer_Scrambler_Modulator完成后段加扰调制
+```mermaid
+flowchart TB
+    TOP["PDCCH_Transmitter_Top"]
+    DL0["delay_1<br/>外层trigger延迟1拍"]
+    CM2S["CM_to_Stream<br/>112bit并行转串行"]
+    PROC["PDCCH_TX_Bit_Processing"]
+    DL1["delay_1<br/>内层trigger再延迟1拍"]
+    CH["PXSCH_Channel_Encoder<br/>参数、CRC、Turbo、速率匹配"]
+    DSM["PXSCH_Deserializer_Scrambler_Modulator<br/>2bit分组、Gold加扰、QPSK"]
+
+    TOP --> DL0 --> PROC
+    TOP --> CM2S
+    PROC --> DL1 --> CH --> DSM
+    CH -->|"ready_for_data"| CM2S
+    CM2S -->|"data + valid"| CH
 ```
+
+进一步展开真正的数据主链：
+
+```mermaid
+flowchart LR
+    CM["CM_message<br/>112bit并行"]
+    SER["CM_to_Stream<br/>1bit/cycle"]
+    PARA["Parameter Computation<br/>按TBS=112查表"]
+    CRC["TB CRC24<br/>112→136"]
+    TURBO["Turbo Encoder<br/>三路母码"]
+    RM["Rate Matcher<br/>重复到7200bit"]
+    B2S["Bit_to_Symbol<br/>每2bit一组"]
+    GOLD["Gold Scrambler"]
+    QPSK["QPSK Modulation"]
+    OUT["3600组I/Q"]
+
+    CM --> SER --> CRC --> TURBO --> RM --> B2S --> GOLD --> QPSK --> OUT
+    PARA -."配置参数".-> CRC
+    PARA -."配置参数".-> TURBO
+    PARA -."配置参数".-> RM
+```
+
+关键握手关系：
+
+```text
+PXSCH_Channel_Encoder.ready_for_data
+        │
+        └──→ PDCCH_TX_Bit_Processing.ready_for_input
+                 │
+                 └──→ CM_to_Stream.ready_for_input
+```
+
+这里的 `ready_for_input` 名字是站在编码器角度说的：编码器说“我可以收bit了”，CM串行器才开始发。
 
 ### 关键代码解读
 
-顶层先把 `PDCCH_trigger` 延迟1拍，再让 `CM_to_Stream` 输出控制bit，随后进入PDCCH bit processing。当前文档只完成调用关系确认，编码细节留待精读。
+#### 1. 顶层实际上只有两块核心逻辑
+
+```verilog
+delay_1 #(1) d0(
+    clk,
+    PDCCH_trigger,
+    PDCCH_trigger_delay1
+);
+
+CM_to_Stream PDCCH_to_BIT(...);
+PDCCH_TX_Bit_Processing generate_PDCCH_symbol(...);
+```
+
+所以 `PDCCH_Transmitter_Top` 本体只是编排层，复杂算法都在 `PDCCH_TX_Bit_Processing` 内部复用的两个PXSCH模块中。
+
+#### 2. CM_to_Stream不是由trigger直接启动
+
+```verilog
+delay_n #(1,1) d0(clk, ready_for_input, asktemp);
+assign askpulse = ready_for_input & (~asktemp);
+```
+
+这段代码对 `ready_for_input` 做上升沿检测：
+
+```text
+上一拍ready=0，当前ready=1
+→ askpulse=1
+→ 启动长度112的strobe
+```
+
+随后：
+
+```verilog
+data <= CM_message[bitindex1];
+```
+
+索引从0到111，因此实际发送顺序为LSB first：
+
+```text
+先发CM_message[0]
+再发CM_message[1]
+...
+最后发CM_message[111]
+```
+
+对应字段顺序为：
+
+```text
+24位保留字段
+→ 60位MCS_array
+→ 4位子帧数量
+→ 24位帧计数器
+```
+
+#### 3. PDCCH固定复用PXSCH编码参数
+
+`PDCCH_TX_Bit_Processing` 给 `PXSCH_Channel_Encoder` 的配置为：
+
+```verilog
+.modulation(`QPSK),
+.redundancy_version_index(`REDUNDANCY_VERSION), // 当前为0
+.number_of_REs(`SUBCARRIER_PER_OFDM),           // 3600
+.transport_block_size(`NUMBER_CM_LENGTH)        // 112
+```
+
+当前 `PXSCH_Channel_Encoder` 内部实际只根据 `transport_block_size=112` 查参数；`modulation`、`number_of_REs` 和RV端口没有进入实际参数计算。但查表中的 `E=7200` 恰好与3600个QPSK RE闭合。
+
+#### 4. 加扰调制也固定使用控制信道配置
+
+```verilog
+.modulation(`QPSK),
+.subframe_index(8'd0),
+.RNTI(`RNTI),
+.cell_ID(`CELL_ID)
+```
+
+所以PDCCH Gold序列固定按子帧0初始化。当前宏值还包括：
+
+```text
+RNTI   = 10
+CELL_ID = 0
+```
+
+#### 5. 后级如何把它放进资源网格
+
+PDCCH输出先进入FIFO：
+
+```verilog
+.wr_en(PDCCH_valid)
+```
+
+资源映射器到达控制消息位置时读取：
+
+```verilog
+.rd_en(CM_flag)
+```
+
+而当前 `Special_Subframe_ChanID` 定义：
+
+```verilog
+special_flag <= (subframe_index == 0);
+CM_flag      <= (symbol_index == 8);
+CM           <= special_flag && CM_flag;
+```
+
+所以准确位置是：
+
+```text
+subframe_index = 0
+symbol_index   = 8
+subcarrier     = 0...3599
+```
+
+这一个OFDM符号的3600个有效子载波全部从PDCCH FIFO读取。
 
 ### 讨论问题
 
-1. PDCCH与PDSCH最终在 `Combine_Control_and_Data` 中按资源网格位置选择，不是在bit级直接拼接。
-2. 后续需核实控制消息实际长度、编码方式、资源位置和当前是否完整遵循LTE PDCCH格式。
+#### PDCCH与PXSCH/PDSCH的本质区别
+
+当前F0工程中，两条路径复用了同一个 `PXSCH_Channel_Encoder`，因此CRC、Turbo编码和速率匹配的基本处理框架相同；最核心的区别是“送进去的bit代表什么”。
+
+```mermaid
+flowchart LR
+    CM["控制信息<br/>CM_message"] --> CMS["CM_to_Stream<br/>112bit并转串"]
+    CMS --> CE1["PXSCH_Channel_Encoder<br/>CRC + Turbo + 速率匹配"]
+
+    UDP["UDP用户数据"] --> MAC["MAC_TX<br/>长度头、payload、padding"]
+    MAC --> CE2["PXSCH_Channel_Encoder<br/>CRC + Turbo + 速率匹配"]
+
+    CE1 --> MOD1["Gold加扰 + 固定QPSK"]
+    CE2 --> MOD2["Gold加扰 + QPSK/16QAM"]
+
+    MOD1 --> PC["PDCCH符号FIFO"]
+    MOD2 --> PD["PDSCH符号FIFO"]
+```
+
+| 对比项 | PDCCH路径 | PXSCH/PDSCH路径 |
+|---|---|---|
+| 输入内容 | 系统控制信息 | 用户业务数据 |
+| 输入来源 | `TTI_Handing_Top.CM_message` | UDP FIFO经过 `MAC_TX` 成帧 |
+| 是否经过MAC | 不经过 | 经过，添加长度头并进行padding |
+| TBS | 固定112 bit | 按MCS选择多个TBS |
+| 信道编码 | 复用 `PXSCH_Channel_Encoder` | 使用同一个模块 |
+| 调制 | 固定QPSK | 当前为QPSK或16QAM |
+| 输出位置 | 子帧0、`symbol_index=8` | PDSCH数据资源位置 |
+| 当前启动方式 | 每个无线帧一次 | 每个子帧三次PDSCH事务 |
+
+可以概括为：
+
+```text
+PDCCH：控制bit → 同一套CRC/Turbo/速率匹配链
+PDSCH：MAC成帧后的用户数据bit → 同一套CRC/Turbo/速率匹配链
+```
+
+但这只是当前F0工程的实现方式。标准LTE PDCCH通常使用尾咬合卷积码而不是Turbo码，所以当前模块属于复用PXSCH处理链的自定义控制信道，不能直接等同于标准LTE PDCCH。
+
+1. **PDCCH和PDSCH在哪里合并？** 不是在bit级相连。两路分别编码和调制，分别写入PDCCH/PDSCH符号FIFO；资源映射器根据 `CM_flag` 或 `Data_flag` 选择读取哪一个FIFO。
+2. **为什么112 bit最后占满3600个子载波？** 因为Turbo母码只有420 bit，但速率匹配把循环缓冲区重复读取到7200 bit；QPSK每2 bit形成1个符号，所以得到3600个符号。
+3. **这是标准LTE PDCCH吗？** 不是。标准LTE PDCCH不是Turbo编码，也不是固定放在子帧0的符号8。当前是工程自定义控制信道。
+4. **PDCCH_trigger多久一次？** `TTI_Handing_Top` 从无线帧起点产生，当前每10 ms无线帧启动一次；消息中携带10个子帧的MCS数组。
+5. **为什么要提前编码再存FIFO？** 编码过程需要时间，而资源映射只在指定时刻读取。FIFO把“生产时间”和“上资源网格时间”解耦。
+6. **CM_to_Stream为什么不直接接PDCCH_trigger？** 它等待编码器 `ready_for_data` 上升，确保参数、CRC状态机等已经准备好，再发第一个控制bit。
+7. **当前反压完整吗？** 编码器到CM串行器有内部ready反馈；但PDCCH输出FIFO的 `full/empty` 没有参与上游停写或下游保护，系统依赖固定时序保证写入提前完成且FIFO容量足够。
+8. **`CM_message`是否在串行器内部锁存？** 没有，串行器直接索引输入总线。因此它依赖 `TTI_Handing_Top` 在112-bit发送期间保持消息稳定；当前MCS数组按无线帧锁存，正常设计意图满足这一条件。
+9. **最值得观察的仿真信号是什么？** `PDCCH_trigger`、两级trigger delay、`ready_for_input`、`askpulse`、`bitindex1`、CM串行 `data/valid`、编码输出valid、PDCCH `symbol_valid`、PDCCH FIFO写使能和 `CM_flag` 读使能。
 
 ## 1.8 Combine_Control_and_Data
 
