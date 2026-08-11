@@ -33,9 +33,150 @@ OFDM_SYMBOL_PER_SLOT     = 7
 OFDM_SYMBOL_PER_RADIO10  = 140
 ```
 
-# 1. TX_BIT_Processor
+# TX_BIT_Processor
 
-## 1.0 TX_BIT_Processor 顶层
+## 0. BIT 处理结束总览：从 UDP 字节到单层 4096 点复数流
+
+一句话先定住：`TX_BIT_Processor` 把“一路 UDP 用户字节 + 一套无线帧时序/配置”变成“一条已经完成信道编码、加扰调制、控制/数据/导频资源映射和 4096 点变换的 Layer 复数流”。
+
+### 0.1 主数据流总图
+
+```mermaid
+flowchart LR
+    RF["radio_frame_trigger<br/>无线帧起点"] --> A["① TX_Trigger<br/>产生一帧140个OFDM符号节拍"]
+    A -->|symbol_start_trigger| B["② TTI_Handing_Top<br/>帧/子帧/符号/子载波计数<br/>并打包CM_message"]
+
+    MCS["MCS_array / MCS_control"] --> B
+    B -->|子帧/符号/帧起点| C["③ TX_PDSCH_Configuration<br/>选MCS、查TBS、产生3次TB启动"]
+    LID["layer_ID"] --> C
+
+    UDP["UDP字节<br/>clk_udp"] --> D["④ Buffer_UDP_Data<br/>异步FIFO跨时钟域"]
+    D -->|8-bit字节| E["⑤ MAC_TX / MAC_FIFO<br/>长度头 + payload + 补零<br/>串行输出TB bit"]
+    E -->|ask_for_data| D
+    C -->|PDSCH trigger + TB size| E
+
+    E -->|TB bit + valid| F["⑥ PXSCH_TX_Bit_Processing_Top<br/>CRC/分段 → Turbo → 速率匹配<br/>Gold加扰 → QPSK/16QAM"]
+    C -->|调制方式/TBS/子帧号/延时触发| F
+
+    B -->|PDCCH_trigger + 112-bit CM_message| G["⑦ PDCCH_Transmitter_Top<br/>CM串行化 → Turbo链 → Gold加扰 → QPSK"]
+
+    F -->|PDSCH I/Q| H["⑧ Combine_Control_and_Data<br/>双FIFO → 资源映射 → RS/保护带/DC<br/>4096点WFRFT"]
+    G -->|PDCCH I/Q| H
+    F -->|延迟后的OFDM符号起点| H
+    LID -->|选择本Layer的RS| H
+    ALPHA["alpha"] -->|选择WFRFT系数| H
+
+    H -->|4096点复数流| I["⑨ Invalidate_Layer_Streams<br/>Layer关闭时I/Q清零"]
+    ACTIVE["layer_active"] --> I
+    I --> OUT["symbol_valid_out<br/>symbol_real / symbol_imag"]
+    OUT -.下一站.-> NEXT["TX_BIT_FIFO_Exchange<br/>把本地3个Layer按内部12位置块重排"]
+
+    classDef timing fill:#dbeafe,stroke:#2563eb,color:#111827;
+    classDef payload fill:#dcfce7,stroke:#16a34a,color:#111827;
+    classDef control fill:#ffedd5,stroke:#ea580c,color:#111827;
+    classDef grid fill:#f3e8ff,stroke:#9333ea,color:#111827;
+    classDef ext fill:#f8fafc,stroke:#64748b,color:#111827;
+    class A,B,C timing;
+    class D,E,F payload;
+    class G control;
+    class H,I,OUT,NEXT grid;
+    class RF,MCS,LID,UDP,ALPHA,ACTIVE ext;
+```
+
+图中有三股并行信息流：
+
+1. 蓝色是时间/配置流，回答“现在是哪个帧、子帧、符号，应该用什么MCS和TBS”；
+2. 绿色是PDSCH用户数据流，完成UDP字节到PDSCH复数调制符号的转换；
+3. 橙色是PDCCH控制流，把112-bit `CM_message` 编成控制信道复数符号；
+4. 三者只在紫色的 `Combine_Control_and_Data` 中真正汇合，形成同一个Layer的4096点输出块。
+
+### 0.2 九个直接子模块及内部层级
+
+```mermaid
+flowchart TB
+    TOP["TX_BIT_Processor"]
+
+    TOP --> A["① TX_Trigger"]
+    A --> A0["delay_1<br/>检测外部trigger上升沿"]
+    A --> A1["TX_Symbol_Start_Generator"]
+    A1 --> A11["sync_latch_another<br/>保持一帧发送状态"]
+    A1 --> A12["feedback_en_7_U16_bmp<br/>选择符号持续拍数"]
+    A1 --> A13["Mod_N_Indexer ×2<br/>符号内拍计数 + 一帧140符号计数"]
+
+    TOP --> B["② TTI_Handing_Top"]
+    B --> B1["Index_Generator"]
+    B1 --> B11["四级时序<br/>无线帧/子帧/符号/3600子载波"]
+    B1 --> B12["PULSE_TO_STROBE_U16 + delay_n<br/>子载波strobe和索引对齐"]
+    B --> B2["MCS锁存 + CM_message打包<br/>PDCCH trigger生成"]
+
+    TOP --> C["③ TX_PDSCH_Configuration"]
+    C --> C1["CM_to_PDSCH_Encoder"]
+    C1 --> C11["MCS_to_TBS<br/>MCS→调制方式/TBS查表"]
+    C --> C2["Trigger_delay ×2<br/>原始/延迟80130/延迟160260三次启动"]
+    C --> C3["delay_n<br/>配置与OFDM时序对齐"]
+
+    TOP --> D["④ Buffer_UDP_Data"]
+    D --> D1["FIFO_Buffer_UDP<br/>8-bit异步FIFO/FWFT"]
+
+    TOP --> E["⑤ MAC_TX"]
+    E --> E1["MAC_FIFO"]
+    E1 --> E11["MAC状态机<br/>32-bit长度头→payload→补零"]
+    E1 --> E12["FIFO_MAC_handshake<br/>字节读取握手"]
+
+    TOP --> F["⑥ PXSCH_TX_Bit_Processing_Top"]
+    F --> F1["PXSCH_Channel_Encoder"]
+    F1 --> F11["PXSCH_Parameter_Computation"]
+    F1 --> F12["CRC_Add_and_CB_Segmentation"]
+    F1 --> F13["Turbo_Encoder_Top<br/>QPP交织 + 2个RSC"]
+    F1 --> F14["TX_Rate_Matcher<br/>交织/循环缓冲/打孔或重复"]
+    F --> F2["PXSCH_Deserializer_Scrambler_Modulator"]
+    F2 --> F21["Scrambler_Cinit_to_X1_X2<br/>生成Gold初态"]
+    F2 --> F22["Bit_to_Symbol + PXSCH_Scrambler<br/>分组并逐bit异或c(n)"]
+    F2 --> F23["LTE_Modulation<br/>QPSK/16QAM映射"]
+    F --> F3["Trigger_Delay_10x + 对齐寄存器<br/>把资源网格起点推迟到编码完成后"]
+
+    TOP --> G["⑦ PDCCH_Transmitter_Top"]
+    G --> G1["CM_to_Stream<br/>112-bit控制字转串行bit"]
+    G --> G2["PDCCH_TX_Bit_Processing"]
+    G2 --> G21["复用PXSCH_Channel_Encoder<br/>固定控制信道参数"]
+    G2 --> G22["复用加扰/调制链<br/>固定QPSK"]
+
+    TOP --> H["⑧ Combine_Control_and_Data"]
+    H --> H1["TX_Resource_Mapper_Top"]
+    H1 --> H11["Index_Generator + TX_ChanID_Map<br/>决定当前位置放PDCCH/PDSCH/RS/0"]
+    H --> H2["PDCCH FIFO + PDSCH FIFO<br/>生产时间与映射时间解耦"]
+    H --> H3["RS_need_code_Gen<br/>按layer_ID插入本层RS"]
+    H --> H4["保护带 + DC_Insertion<br/>3600→4095→4096点"]
+    H --> H5["WFRFT_Alpha_Indicate + WFRFT_TX"]
+    H5 --> H51["RAM + 4096点FFT + 反序读取<br/>构造X0/X1/X2/X3"]
+    H5 --> H52["4路复乘并求和<br/>按alpha选择WFRFT结果"]
+
+    TOP --> I["⑨ Invalidate_Layer_Streams"]
+    I --> I1["无下级功能模块<br/>寄存器完成valid透传与I/Q门控"]
+```
+
+### 0.3 按“输入 → 处理 → 输出”快速复盘
+
+| 模块 | 主要输入 | 实际处理 | 主要输出 |
+|---|---|---|---|
+| `TX_Trigger` | 一次无线帧触发 | 把一次帧触发展开成一帧内140个OFDM符号节拍 | `symbol_start_trigger` |
+| `TTI_Handing_Top` | 符号节拍、`MCS_array` | 维护帧/子帧/符号/子载波时序，锁存MCS并组成112-bit控制消息 | 各级起点、索引、`PDCCH_trigger`、`CM_message` |
+| `TX_PDSCH_Configuration` | 子帧时序、Layer、MCS | 选择当前Layer/子帧的MCS，查TBS，并产生三次TB编码启动 | `PDSCH_transmitter_trigger`、调制方式、TBS、延迟时序 |
+| `Buffer_UDP_Data` | UDP时钟域8-bit字节 | 异步FIFO跨到基带时钟域；只有MAC请求时才读 | MAC输入字节、有效信号、FIFO字节数 |
+| `MAC_TX` | UDP字节、TB大小、启动信号 | 依次发送32-bit长度头、payload，再补零到规定TB长度 | 串行TB bit及valid |
+| `PXSCH_TX_Bit_Processing_Top` | TB bit、MCS/TBS/子帧配置 | CRC、码块分段、Turbo、速率匹配、Gold加扰、调制，并延迟OFDM触发 | PDSCH I/Q符号、valid、延迟后的符号起点 |
+| `PDCCH_Transmitter_Top` | 112-bit `CM_message`、PDCCH启动 | 控制字串行化，复用Turbo编码和加扰调制链，固定输出QPSK符号 | PDCCH I/Q符号及valid |
+| `Combine_Control_and_Data` | 两路I/Q、符号起点、Layer、alpha | FIFO缓存，按资源网格选择PDCCH/PDSCH/RS/0，补保护带和DC，再做4096点WFRFT | 4096点复数Layer流 |
+| `Invalidate_Layer_Streams` | Layer复数流、`layer_active` | Layer开则透传；Layer关则I/Q清零但valid保持连续 | `TX_BIT_Processor`最终I/Q和valid |
+
+### 0.4 读图时最容易混淆的四点
+
+1. `PDCCH_Transmitter_Top` 和 `PXSCH_TX_Bit_Processing_Top` 不是前后级，而是两条并行支路；它们在 `Combine_Control_and_Data` 才合并。
+2. `TTI_Handing_Top` 产生的是原始无线帧时间基准；由于编码需要时间，真正交给资源映射器的 `start_of_symbol` 是 `PXSCH_TX_Bit_Processing_Top` 延迟后的触发。
+3. `Combine_Control_and_Data` 的两个FIFO不是上一级模块里的FIFO，而是该模块内部的 `FIFO_for_PDCCH_symbol` 和 `FIFO_for_PDSCH_symbol`。
+4. `TX_BIT_Processor` 每个实例只处理一个Layer；一个FPGA例化三个实例产生本地三层，后面的 `TX_BIT_FIFO_Exchange` 才把三层按内部12位置块重新组织。
+
+## TX_BIT_Processor 顶层
 
 ### 实现功能
 
@@ -4111,512 +4252,10 @@ end
 1. **为什么不把valid也清零？** 后续MIMO处理按valid统计行、子载波和RB位置；清除valid会缩短网格并让其他layer错位。零数据表示该layer在当前位置不贡献能量。
 2. 数据寄存器没有显式复位分支，复位后到首个有效时钟前仿真可能看到X；是否需要补复位取决于下游是否严格受valid门控。
 
-# 2. TX_BIT_FIFO_Exchange
-
-## 2.0 TX_BIT_FIFO_Exchange 顶层
-
-### 实现功能
-
-`TX_BIT_FIFO_Exchange` 位于三个本地 `TX_BIT_Processor` 之后、`FIFO_Manager/Aurora` 之前。它把本FPGA同时产生的3条layer复数流从“每拍3个32-bit并行字”改造成“一路32-bit串行字”，按4个频率位置和12子载波RB重新排序，再把相邻两个32-bit字打包成64 bit，并给出这批数据的目标FPGA编号。
-
-它不是跨时钟FIFO，也不负责MIMO矩阵运算；它负责的是：
-
-```text
-三层并行复数流
-→ 缓存和并串转换
-→ 按4位置×3层重排
-→ 按RB轮转目标FPGA
-→ 32 bit两两打包成64 bit
-→ 交给FIFO_Manager分流到本地回环或Aurora链路
-```
-
-在 `MIMO_TX_Top` 中，三个 `TX_BIT_Processor` 分别提供 `symbol_real0/1/2`、`symbol_imag0/1/2`。模块只使用 `symbol_valid0` 作为公共 `iDataEn`，因此默认三条layer严格同步。
-
-### 实现原理解读
-
-#### 1. 输入和输出
-
-每条layer每拍输入一个32-bit复数样点：
-
-```text
-L0 = {iL0I[15:0], iL0R[15:0]}
-L1 = {iL1I[15:0], iL1R[15:0]}
-L2 = {iL2I[15:0], iL2R[15:0]}
-```
-
-`iDataEn` 有效时，三条layer同时各产生一个复数样点，相当于每拍进入96 bit。输出接口为：
-
-```text
-data_64bit_valid：64-bit输出有效
-FGPA_ID：目标FPGA编号；源码端口名把FPGA拼成了FGPA
-data_64bit：两个连续32-bit复数样点组成的64-bit字
-```
-
-输出进入 `MIMO_Project_Top` 中的 `FIFO_Manager`。`FIFO_Manager` 用目标ID把数据写入四条BIT2MIMO分支：本地loopback或三条Aurora链路。
-
-#### 2. 检测一段4096点输入的开始
-
-```verilog
-delay_1 #(1) d0(iCLK,iDataEn,iDataEnd1);
-enp <= iDataEn & (~iDataEnd1);
-```
-
-`iDataEnd1` 实际是 `iDataEn` 延迟1拍，`enp` 因而是输入有效上升沿脉冲；名字中的 `End` 容易误导，它检测的是开始而不是结束。
-
-`enp` 启动：
-
-```verilog
-PULSE_TO_STROBE_U16_delay1 pulse2strobe_4(
-    .start_pulse(enp),
-    .N(16'd12288),
-    .strobe(long_t4)
-);
-```
-
-一个OFDM变换块每条layer有4096个复数点，三条layer合计：
-
-```text
-4096 × 3 = 12288个32-bit复数字
-```
-
-所以 `long_t4` 标记整个并串转换输出区。它延迟5拍形成 `oEn`，用于与读取、旁路和 `oData` 寄存器对齐。
-
-#### 3. 为什么Layer0前4个样点走旁路
-
-Layer1、Layer2从第一个有效样点开始全部写FIFO：
-
-```verilog
-FIFO1.wr_en = iDataEn;
-FIFO2.wr_en = iDataEn;
-```
-
-Layer0被拆成两部分：
-
-```verilog
-wrL0   = iDataEn & iDataEnd4;     // 第5个有效拍起写FIFO
-nrwrL0 = iDataEn & ~iDataEnd4;    // 最前4个有效拍
-```
-
-前4个L0样点不写FIFO，而是：
-
-```text
-{iL0I,iL0R}
-→ oDD3
-→ 延迟5拍
-→ oD3旁路
-```
-
-后续L0样点写入 `FIFO_for_TX_BIT_Buffer0`。第一次 `long_t0` 读取窗口由 `long_t4d6` 屏蔽，不读L0 FIFO，输出来自旁路；后续L0窗口才读FIFO。这样既补偿FIFO读取延迟，也避免最前4个L0样点重复或丢失。
-
-三个 `FIFO_for_TX_BIT_Buffer` 都是32 bit × 4096的同钟Block RAM标准FIFO。它们承担的核心任务是：输入端每拍同时到来3个字，但输出端每拍只能消费1个字，因此必须保存尚未轮到输出的layer数据。
-
-#### 4. 12拍调度：每次输出4个L0、4个L1、4个L2
-
-`cnt0` 在 `long_t4` 期间按0～11循环：
-
-```verilog
-flag1 <= (cnt==0) & long_t4;
-flag2 <= (cnt==4) & long_t4;
-flag3 <= (cnt==8) & long_t4;
-```
-
-三个flag进一步变成3个4拍读取窗口：
-
-```text
-long_t0：4拍，选择Layer0
-long_t1：4拍，选择Layer1
-long_t2：4拍，选择Layer2
-```
-
-逻辑输出顺序是：
-
-```text
-第0～3个位置：  L0[0] L0[1] L0[2] L0[3]
-                  L1[0] L1[1] L1[2] L1[3]
-                  L2[0] L2[1] L2[2] L2[3]
-
-第4～7个位置：  L0[4]...L0[7]
-                  L1[4]...L1[7]
-                  L2[4]...L2[7]
-
-第8～11个位置： L0[8]...L0[11]
-                  L1[8]...L1[11]
-                  L2[8]...L2[11]
-```
-
-每4个位置产生12个32-bit字；连续3组覆盖12个子载波，也就是一个RB在本地3条layer上的数据：
-
-```text
-12子载波 × 3层 = 36个32-bit字 = 18个64-bit字
-```
-
-4096不能被12整除，因此整个块包含341个完整12位置分组，末尾还剩4个位置；代码依靠固定 `long_t4=12288` 精确结束，而不是假设整块一定包含整数个RB。
-
-#### 5. 四路数据为什么能按位OR
-
-```verilog
-oD0 = oDD0 & {32{v0}};
-oD1 = oDD1 & {32{v1}};
-oD2 = oDD2 & {32{v2}};
-oData <= oD0 | oD1 | oD2 | oD3;
-```
-
-`oD0/oD1/oD2` 只有对应FIFO输出 `valid` 时非零，`oD3` 只在最前4个L0旁路样点时非零。正常调度下四路互斥，所以按位OR等价于四选一MUX。若读取窗口错位导致两路同时非零，OR会破坏数据。
-
-#### 6. 目标FPGA如何轮转
-
-`cntt1` 在稳定运行时按1、2、3循环，用来统计三个“4位置小组”；每完成三组，`cntt2` 加1。也就是目标ID按12个频率位置的数据块轮转。
-
-代码中的ID查找表为：
-
-```text
-cntt2=0 → fpga=2
-cntt2=1 → fpga=1
-cntt2=2 → fpga=3
-cntt2=3 → fpga=0
-```
-
-随后循环。对当前编译参数 `FPGA_ID=3`，`FIFO_Manager` 将ID解释为：
-
-```text
-ID=3：本地loopback
-ID=0：Aurora0
-ID=1：Aurora1
-ID=2：Aurora2
-```
-
-静态代码可以确定上述轮转表和RB级切换关系；但复位后的第一个外部有效64-bit字究竟对应表中哪一项，还同时受 `enp`、`oEn`、`fpga`寄存器以及 `TX_BIT_Data_Processing` 的两拍ID延时影响，不能只看case顺序下结论，应该通过仿真波形核实。
-
-#### 7. TX_BIT_Data_Processing如何打包64 bit
-
-该子模块用1-bit计数器把相邻两个有效32-bit字组成一个64-bit字：
-
-```verilog
-data_64bit <= counter ? {data_32bit,data_32bit_delay1} : 64'd0;
-```
-
-所以：
-
-```text
-data_64bit[31:0]  = 前一个32-bit复数样点
-data_64bit[63:32] = 当前32-bit复数样点
-```
-
-输出有效每两个32-bit有效拍出现一次。由于12288、每个目标块36和末尾12都是偶数，正常情况下不会把一对64-bit数据拆到两个目标FPGA。
-
-总数量闭合：
-
-```text
-输入：4096拍 × 3个32-bit字/拍 = 12288个32-bit字
-输出：12288 / 2 = 6144个64-bit字
-```
-
-### 子模块关系图
-
-```mermaid
-flowchart LR
-    IN["L0/L1/L2并行I/Q<br/>每拍3×32 bit"] --> L0B["L0前4点旁路"]
-    IN --> F0["L0 FIFO<br/>第5点起写"]
-    IN --> F1["L1 FIFO"]
-    IN --> F2["L2 FIFO"]
-    START["iDataEn上升沿"] --> WIN["12288拍总窗口"]
-    WIN --> SCHED["0～11计数<br/>每层选择4拍"]
-    SCHED --> F0
-    SCHED --> F1
-    SCHED --> F2
-    L0B --> MUX["互斥清零后按位OR<br/>一路32-bit流"]
-    F0 --> MUX
-    F1 --> MUX
-    F2 --> MUX
-    SCHED --> ID["每3个小组轮转目标FPGA"]
-    MUX --> PACK["TX_BIT_Data_Processing<br/>2×32 → 64 bit"]
-    ID --> PACK
-    PACK --> OUT["data_64bit_valid<br/>FGPA_ID<br/>data_64bit"]
-    OUT --> FM["FIFO_Manager<br/>本地或Aurora分流"]
-```
-
-### 关键代码解读
-
-最应该先观察的信号分为四组：
-
-```text
-输入块开始：iDataEn、iDataEnd1、enp、long_t4、oEn
-层调度：cnt、imp0/1/2、long_t0/1/2、rdL0/1/2
-数据：oD3、oD0/1/2、oData
-路由打包：cntt1、cntt2、fpga、oFpga、data_64bit_valid、FGPA_ID、data_64bit
-```
-
-一个最小仿真可以让L0、L1、L2输入明显不同的递增序列，例如：
-
-```text
-L0[n] = 0x0...n
-L1[n] = 0x1...n
-L2[n] = 0x2...n
-```
-
-然后验证32-bit `oData` 是否按 `L0[0..3]、L1[0..3]、L2[0..3]、L0[4..7]...` 输出，64-bit是否低半字在前、高半字在后，目标ID是否只在36个32-bit字/18个64-bit字的边界切换。
-
-### 讨论问题
-
-1. **为什么不能直接把三层拼成96 bit？** 下游 `FIFO_Manager/Aurora` 接口按64 bit和目标FPGA分流，MIMO端又按RB汇聚12层，因此这里先完成三层并串重排和路由。
-2. **为什么每层一次读4个？** 4个频率位置 × 3条本地layer = 12个32-bit字；连续3组覆盖一个RB的12个子载波，便于后续按RB汇聚和MIMO处理。
-3. **为什么L0特殊，L1/L2不旁路？** 输出顺序以L0开始，但FIFO有读取延迟；前4个L0直接延迟输出可以立即启动串行流，其他数据在这段时间已写入FIFO。
-4. **这个模块是否跨时钟？** 否。输入、三个内部FIFO、调度器和64-bit打包都使用 `iCLK`；真正跨板/链路处理在后级 `FIFO_Manager/Aurora`。
-5. **目标FPGA顺序是否已经完全确认？** case表为2、1、3、0并循环，稳定切换周期为一个12子载波块；第一个外部有效字受多级流水影响，仍应通过仿真确认起始相位。
-6. **FIFO安全吗？** 三个FIFO的 `full/empty` 都没有参与控制，输出总valid也不检查三路数据是否确实齐备，依赖固定4096点输入和既定调度；异常断流可能导致零值、层错位或跨RB错位。
-7. **代码中是否有无效逻辑？** `long_t3 → sync_latch → out` 的结果未被后续使用，`Fpga1`、`long_t4d4` 等声明也未形成有效数据路径；`flag0` 仅进入case默认分支。这些遗留信号增加了阅读难度。
-8. **`FGPA_ID`是什么意思？** 只是源码拼写错误，语义仍是目标 `FPGA_ID`。
-
-# 3. TX_MIMO_Processor
-
-## 3.0 TX_MIMO_Processor 顶层
-
-### 实现功能
-
-从跨板汇聚后的128位 payload FIFO 读取12层数据，按当前“直接预编码”规则扩展成32个发射天线行，再拆分并打包到两路64位 MIMO-to-RRH FIFO。
-
-### 实现原理解读
-
-```text
-128-bit layer payload
- → 按RB读取12个连续行
- → TX_Precoding_Direct扩展为32个天线行
- → Submatrix_Splitter分两组
- → 2×MIMO_TX_Pack_Data
- → 两路64-bit FIFO
-```
-
-这里的 `TX_Precoding_Direct` 没有执行信道相关矩阵乘法。它在检测到输入valid上升沿后产生长度为 `NUMBER_ANTENNA=32` 的输出窗口：
-
-```text
-index 0..11  ：输出当前12行
-index 12..23 ：输出延迟12拍的同一组12行
-index 24..31 ：输出延迟24拍后的前8行
-```
-
-等价于把12层行序列重复成32个天线行，是固定直接映射，不是常见的 `x=W·s` 自适应/码本预编码。
-
-### 子模块关系图
-
-```text
-TX_MIMO_Processor
-├─ MIMO_TX_Trigger：按RB和FIFO余量产生读取节拍
-├─ MIMO_Processor_Payload_Reader：读出12行子矩阵
-├─ TX_Precoding_Direct：12层直接重复到32天线行
-├─ Submatrix_Splitter：拆成前/后天线组
-└─ 2×MIMO_TX_Pack_Data：打包64位FIFO字
-```
-
-### 关键代码解读
-
-Payload Reader 输出模式的源码注释为：
-
-```text
-连续12拍输出一个子矩阵，随后空32拍
-```
-
-直接预编码选择：
-
-```verilog
-if(index < 12)       data_out <= data_delay1;
-else if(index > 23)  data_out <= data_delay25;
-else                 data_out <= data_delay13;
-```
-
-两路打包分别对应前16根和后16根天线的数据组织。
-
-### 讨论问题
-
-1. **当前是否真正做了MIMO预编码？** 只做固定直接映射/重复，没有看到信道矩阵或码本权重乘法。
-2. **为什么输入12行、输出32行？** 系统定义12层、32发射天线；当前模块用重复映射补足32个天线行。
-3. **128位一拍代表什么？** 当前注释表示4列复数数据的组合，精确位域和行列方向应在 `MIMO_Processor_Payload_Reader`、`Submatrix_Splitter` 精读时画图确认。
-
-# 4. TX_RRH_FIFO_Exchange
-
-## 4.0 TX_RRH_FIFO_Exchange 顶层
-
-### 实现功能
-
-把 MIMO 处理输出的“按RB/子矩阵、覆盖多天线”的FIFO顺序，重新排列为 RRH 需要的“按天线组、覆盖全部RB”的四路FIFO顺序。
-
-### 实现原理解读
-
-输入分布按RB归属在四路外部FIFO中；模块根据 `RB_count` 选择当前应读哪一路，每个完整RB读取48个64位元素，最后一个不完整RB读取16个元素。写端再按两根天线一组分配到四个本地 RRH FIFO：
-
-```text
-FIFO1 → antenna 0/1
-FIFO2 → antenna 2/3
-FIFO3 → antenna 4/5
-FIFO4 → antenna 6/7
-```
-
-### 子模块关系图
-
-```text
-4路MIMO FIFO
- → RB_count与FIFO余量判决
- → 48/16拍读取窗口
- → 数据重新排序
- → RRH_SYNC_Control跨板充足握手
- → 4×FIFO_for_TX_RRH_Buffer
- → 四个天线对FIFO
-```
-
-### 关键代码解读
-
-RB与输入FIFO的当前对应关系：
-
-```text
-RB mod4 = 2 → 读FIFO1
-RB mod4 = 0 → 读FIFO2
-RB mod4 = 3 → 读FIFO3
-RB mod4 = 1 → 读FIFO4
-```
-
-```verilog
-N_input <= (last_partial_RB ? 16 : 48);
-RB_count <= falling_edge ? ((RB_count==341) ? 0 : RB_count+1) : RB_count;
-```
-
-只有同步控制确认四路以及上游阶段数据充足时，才向后级报告可读总量16384。
-
-### 讨论问题
-
-1. 这是“存储布局转置”模块，不进行调制、预编码或滤波。
-2. 342个RB是整个分布式交换网格的内部组织数量，不应直接当作LTE空口带宽RB数；它与四块FPGA、子矩阵和本工程自定义布局有关。
-3. 四个输出FIFO的full端口未使用，安全性依赖固定生产/消费节拍和充足握手，需要波形验证。
-
-# 5. TX_RRH_Processor
-
-## 5.0 TX_RRH_Processor 顶层
-
-### 实现功能
-
-从四个天线对FIFO按无线帧和OFDM符号节拍读取数据，分别送入四条 `TX_RRH_Chain`，输出本 FPGA 对应的8路天线复数基带信号。
-
-### 实现原理解读
-
-`TX_Throttle` 根据源FIFO可读量和目标FIFO剩余空间决定何时启动；`Radio_Frame_Start_Generator` 形成一帧的符号时间线；`TX_FIFO_Read_Pattern_Generator` 给出具体读FIFO窗口。四条RRH链共享相同控制节拍，每条处理两根天线。
-
-### 子模块关系图
-
-```text
-TX_RRH_Processor
-├─ TX_Throttle：源/目标容量检查
-├─ Radio_Frame_Start_Generator：帧和符号节拍
-├─ TX_FIFO_Read_Pattern_Generator：FIFO读模式
-└─ 4×TX_RRH_Chain
-   ├─ Chain0 → antenna 0/1
-   ├─ Chain1 → antenna 2/3
-   ├─ Chain2 → antenna 4/5
-   └─ Chain3 → antenna 6/7
-```
-
-### 关键代码解读
-
-```verilog
-TX_Throttle #(17543)
-```
-
-注意这里的17543与前级 `FEEDBACK_1/2=17443` 不同，二者相差100拍，不能混为同一个常量。
-
-FIFO读请求设计为2拍延时：
-
-```text
-read_FIFO_flag
- → 延迟2拍得到data_in_valid
- → 与FIFO_data一起进入TX_RRH_Chain
-```
-
-### 讨论问题
-
-1. `TX_RRH_Chain` 才是继续核实IFFT/WFRFT后时域整理、CP插入和天线数据成形的位置；顶层本身主要负责节流和四链并行。
-2. 17443与17543的100拍差值应结合链内延时解释，不能先验地称为CP或保护间隔。
-3. 只有Chain0的 `data_valid` 被接到顶层输出，设计默认四条链严格同步；需要仿真确认其他三链不会偏拍。
-
-# 6. Over_Sample_Group
-
-## 6.0 Over_Sample_Group 顶层
-
-### 实现功能
-
-对8路天线I/Q基带样点进行缓存、时钟域适配、插零上采样和FIR插值滤波，再截位/饱和成16位DAC数据。
-
-### 实现原理解读
-
-每根天线实部、虚部分开处理，共16条标量通路：
-
-```text
-16-bit基带样点
- → FIFO缓存/跨时钟
- → 插零形成更高采样率序列
- → FIR_Filter_for_Upsampling
- → 32-bit滤波结果
- → over_under截位和溢出处理
- → 16-bit DAC样点
-```
-
-天线0..3使用同类同步FIFO，天线4..7使用带 `Asyn` 名称的FIFO，在 `clk` 与 `fmc2_dac_clk` 之间完成时钟适配。
-
-### 子模块关系图
-
-```text
-Over_Sample_Group
-├─ 8×real FIFO + 8×imag FIFO
-├─ 有效窗口/插零控制
-├─ 8×real FIR + 8×imag FIR
-└─ 16×over_under：32位结果缩放为16位
-```
-
-### 关键代码解读
-
-模块包含：
-
-```text
-16个输入FIFO
-16个FIR_Filter_for_Upsampling
-16个over_under定点截位模块
-```
-
-`write_zero[15:0]` 在有效无线帧窗口之外且FIFO未接近满时持续写0，使滤波器输入在空闲区保持定义良好的零序列。
-
-### 讨论问题
-
-1. 上采样倍率不能只从模块名推断，应结合 `counter/counter_asyn`、FIFO读使能和FIR输入valid波形确认。
-2. `over_under` 的 `MSB=30、LSB=15` 表明从32位滤波结果截取定点窗口；是否带饱和、舍入还是直接截断需精读该子模块。
-3. 当前大量full/empty异常检查逻辑被注释，正式上板前应确认FIFO不会在跨时钟启动或停帧时溢出/读空。
-
 ---
 
-学习顺序建议：
+## 后续模块
 
-```text
-第一遍通读：
-TX_BIT_Processor
- → TX_BIT_FIFO_Exchange
- → TX_MIMO_Processor
- → TX_RRH_FIFO_Exchange
- → TX_RRH_Processor
- → Over_Sample_Group
+下一模块单独记录在 [TX_BIT_FIFO_Exchange学习.md](./TX_BIT_FIFO_Exchange学习.md)；全部顶层直接子模块见 [MIMO_TX_Top子模块学习索引.md](./MIMO_TX_Top子模块学习索引.md)。
 
-第二遍难点精读：
-TTI/资源映射
- → Turbo/速率匹配
- → Gold加扰/调制
- → 12层到32天线的数据布局
- → RRH链/CP/上采样
-```
-
-待验证清单：
-
-- [ ] 恢复被乱码注释吞掉的 RTL 连接并通过语法检查；
-- [ ] 用波形测量17443、17543和 `Trigger_Delay_10x` 的真实周期差；
-- [ ] 核对 `Combine_Control_and_Data` 的3600有效子载波到4096点内部网格映射；
-- [ ] 验证每子帧三次PDSCH transaction与9/13个PDSCH符号的完整闭合；
-- [ ] 精读 `TX_BIT_FIFO_Exchange` 的12拍调度和64位数据格式；
-- [ ] 精读 `TX_RRH_Chain` 内部的变换、CP插入和天线时域输出；
-- [ ] 验证 `Over_Sample_Group` 的实际上采样倍率与定点缩放。
-
----
-
-*最后更新：2026-08-10*
+*最后更新：2026-08-11*
