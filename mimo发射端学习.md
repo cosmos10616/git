@@ -3512,45 +3512,562 @@ PDSCH：MAC成帧后的用户数据bit → 同一套CRC/Turbo/速率匹配链
 
 ### 实现功能
 
-缓存PDCCH/PDSCH符号，生成参考信号，按照当前OFDM符号和子载波位置完成频域资源映射，再执行DC插入和WFRFT发送变换。
+`Combine_Control_and_Data` 是单个发送层的“频域装帧 + 发送变换”模块。它位于 `TX_BIT_Processor` 内部，接收已经完成编码、加扰和调制的 PDCCH/PDSCH 复数符号，不再处理 bit。
+
+它完成五件事：
+
+1. 用两个 FIFO 分别缓存 PDCCH 和 PDSCH 调制符号；
+2. 根据当前子帧号和 OFDM 符号号，判断这 3600 个有效子载波应放 PDCCH、PDSCH、RS 还是零；
+3. 在有效子载波两侧补 248 点和 247 点保护带，先组成 4095 点；
+4. 在中间插入 1 个直流零点，得到完整的 4096 点频域输入；
+5. 将 4096 点数据送入 `WFRFT_TX`，输出后续发送链所需的复数数据流。
+
+最重要的认识是：**本模块不是把 PDCCH bit 和 PDSCH bit 串接，而是在频域资源位置上选择应该输出哪一种复数调制符号。**
+
+主要接口如下：
+
+| 接口 | 含义 |
+|---|---|
+| `start_of_symbol` | 一个新 OFDM 符号开始，驱动内部子帧/符号/子载波计数 |
+| `PDCCH_valid`、`PDCCH_symbol_real/imag` | PDCCH 调制器产生的复数符号及写 FIFO 有效信号 |
+| `PDSCH_valid`、`PDSCH_symbol_real/imag` | PDSCH 调制器产生的复数符号及写 FIFO 有效信号 |
+| `layer_ID` | 当前发送层编号，用于选择该层的 RS |
+| `alpha` | 普通符号送入 `WFRFT_TX` 时使用的变换阶次控制 |
+| `FFT_valid`、`FFT_symbol_real/imag` | `WFRFT_TX` 的输出；`FFT_*` 是历史接口命名 |
+
+#### 推荐阅读顺序：不要从第一行顺序读到最后一行
+
+第一次阅读 `Combine_Control_and_Data.v` 时，只花 15～20 分钟建立骨架，不要求理解全部延时和子模块内部实现。按下面顺序阅读：
+
+1. 先到 `TX_BIT_Processor.v` 中找到 `Combine_Control_and_Data` 的例化，确认它上接 PDCCH/PDSCH 调制输出，下接本层发送复数流；
+2. 看本模块端口，给输入分成“时序控制、PDCCH数据、PDSCH数据、层/变换参数”四组；
+3. 跳过所有 `delay_1`，先找模块例化，列出 `TX_Resource_Mapper_Top`、两个 FIFO、`RS_need_code_Gen`、`DC_Insertion` 和 `WFRFT_TX`；
+4. 找 FIFO 的 `wr_en` 和 `rd_en`，回答“谁生产符号、谁决定消费符号”；
+5. 找 `current_data` 的赋值，回答“PDCCH、PDSCH、RS最终在哪里汇成一路”；
+6. 找 `long_4095` 和 `DC_Insertion`，回答“3600为什么最后变成4096”；
+7. 最后再回头检查 `delay_1`，只验证数据与 `valid/start` 是否对齐；
+8. `WFRFT_TX` 内部最复杂，第一次只确认输入、输出和 `alpha` 选择，不立刻深入乘法器、FFT IP和定点截位。
+
+第一次看完只需能回答五个问题：
+
+```text
+1. 输入数据从哪里来？
+2. 输出数据到哪里去？
+3. 数据在哪里被缓存或改变？
+4. 哪个valid/enable让数据向前走？
+5. 这个模块在无线帧资源网格中负责哪一步？
+```
+
+第二遍再沿一条真实路径追踪，例如“子帧0、OFDM符号8的第一个PDCCH符号”：
+
+```text
+PDCCH_symbol + PDCCH_valid
+  -> 写入PDCCH FIFO
+  -> 子帧0/符号8到来，CM_flag拉高
+  -> FIFO读出第一个PDCCH复数符号
+  -> PDCCH_data_fin
+  -> current_data
+  -> 4095点频域序列
+  -> DC_Insertion组成4096点
+  -> WFRFT_TX
+```
+
+第三遍才处理延时：以 `CM_flag` 为起点，逐拍核对 FIFO `valid`、`PDCCH_data_fin`、`current_data` 和 `remove_DC_valid`。这种“结构 → 一条数据路径 → 时序对齐”的顺序，比从第1行逐行解释更容易形成整体认识。
 
 ### 实现原理解读
 
+#### 0. 先分清输入端的两条时间线
+
+理解本模块最关键的不是先数延时，而是先把两类输入信号分开：
+
 ```text
-PDCCH/PDSCH I/Q
- → 各自FIFO缓存
- → TX_Resource_Mapper_Top决定当前位置的符号类型
- → RS_need_code_Gen生成参考信号
- → 选择PDCCH/PDSCH/RS/0
- → DC_Insertion
- → WFRFT_TX
- → FFT_*命名的复数输出
+符号生产时间线：PDCCH_valid / PDSCH_valid
+    表示前级现在生成了一个调制符号，用来写FIFO。
+
+空口发送时间线：start_of_symbol
+    表示资源网格进入新的OFDM符号，用来产生CM_flag、Data_flag和RS_flag。
 ```
+
+两条时间线通常不同步。PDCCH/PDSCH可以提前完成编码调制并写入FIFO；等资源网格走到指定OFDM符号时，`CM_flag` 或 `Data_flag` 再从FIFO读取。因而本模块从输入到输出的主线是：
+
+```text
+PDCCH/PDSCH I/Q输入
+  -> valid写入各自FIFO
+  -> start_of_symbol驱动资源位置判定
+  -> CM_flag/Data_flag读取对应FIFO，RS_flag生成RS
+  -> 三路无效数据清零并合成current_data
+  -> 248+3600+247形成4095点
+  -> 中间插入DC零点形成4096点
+  -> WFRFT_TX
+  -> FFT_valid及输出I/Q
+```
+
+#### 1. 两个 FIFO 在哪里
+
+两个 FIFO 都直接例化在 `Combine_Control_and_Data.v` 内部：
+
+- `FIFO_for_PDCCH_symbol PDCCH_symbol`：32 bit × 4096；
+- `FIFO_for_PDSCH_symbol PDSCH_symbol`：32 bit × 16384。
+
+每个 FIFO 字保存一个复数调制符号：
+
+```verilog
+din = {symbol_imag[15:0], symbol_real[15:0]};
+```
+
+因此一个 FIFO 字的低 16 bit 是 I，高 16 bit 是 Q。两者都是同一时钟的 Block RAM 标准 FIFO。PDSCH FIFO 更深，是因为一个子帧内 PDSCH 占用的 OFDM 符号远多于 PDCCH。
+
+写 FIFO 和读 FIFO 使用不同的控制信号：
+
+```text
+PDCCH 调制器 --PDCCH_valid--> 写 PDCCH FIFO
+PDSCH 调制器 --PDSCH_valid--> 写 PDSCH FIFO
+
+资源映射器 --CM_flag-------> 读 PDCCH FIFO
+资源映射器 --Data_flag-----> 读 PDSCH FIFO
+```
+
+这说明 FIFO 的作用是把两个时间过程解耦：前面的编码调制模块可以提前生产符号，后面的资源映射器等到指定 OFDM 符号到来时再消费符号。
+
+#### 2. 资源映射器决定“现在读谁”
+
+`TX_Resource_Mapper_Top` 内部重新使用 `Index_Generator`，由 `start_of_symbol` 得到当前 `subframe_index` 和 `symbol_index`，并在 3600 个有效子载波期间产生资源类型标志。
+
+当前工程按“整个 OFDM 符号”分配类型，而不是在同一个 OFDM 符号内对每个资源粒子做细粒度混排。也就是说，`CM_flag` 一旦在符号 8 拉高，会连续保持 3600 个有效子载波周期，从 PDCCH FIFO 连续读出 3600 个复数符号。
+
+子帧 0 的 14 个 OFDM 符号安排为：
+
+| OFDM 符号号 | 映射类型 | 本模块的数据来源 |
+|---:|---|---|
+| 0 | `RS_need_code` | `RS_need_code_Gen` |
+| 1 | `Data` | PDSCH FIFO |
+| 2 | `PSS` | 当前 `PSS` 端口未连接，因此实际为零 |
+| 3 | `RS_neednot_code` | 仍然送入同一个 `RS_need_code_Gen` |
+| 4、5、6 | `Data` | PDSCH FIFO |
+| 7 | `RS_need_code` | `RS_need_code_Gen` |
+| 8 | `CM_message` | PDCCH FIFO |
+| 9、10、11、12、13 | `Data` | PDSCH FIFO |
+
+子帧 1～9 的安排更简单：
+
+| OFDM 符号号 | 映射类型 | 本模块的数据来源 |
+|---:|---|---|
+| 0 | `RS_need_code` | `RS_need_code_Gen` |
+| 1～13 | `Data` | PDSCH FIFO |
+
+所以在一帧中，PDCCH FIFO 只在子帧 0、符号 8 被读取；PDSCH FIFO 在所有标为 `Data` 的 OFDM 符号中被读取。
+
+#### 3. FIFO、RS 和零值如何合成一路
+
+两个 FIFO 都是标准 FIFO，代码注释标明读延迟为 2 拍。FIFO 的 `valid` 到来后，数据先进入 `PDCCH_data_fin` 或 `PDSCH_data_fin`；没有有效输出时，相应寄存器被清零。
+
+RS 走另一条并行通路：
+
+```text
+RS_need_code_flag 或 RS_not_code_flag
+              |
+              v
+       RS_need_code_Gen
+              |
+              v
+       {RS_imag, RS_real}
+```
+
+`RS_need_code_Gen` 的延迟为 3 拍。它根据 `layer_ID` 选择本层应出现的 RS 位置；不应输出 RS 的时钟，I/Q 主动输出零。
+
+三路最后用按位或合成：
+
+```verilog
+current_data <= PDSCH_data_fin |
+                PDCCH_data_fin |
+                {RS_imag, RS_real};
+```
+
+这段写法形式上是 OR，设计含义却是一个 one-hot 多路选择器：正常情况下三路中只能有一路非零，其余两路必须为零。因此：
+
+```text
+CM_flag=1             -> PDCCH 非零，PDSCH=0，RS=0
+Data_flag=1           -> PDSCH 非零，PDCCH=0，RS=0
+RS_flag=1             -> RS 可能非零，PDCCH=0，PDSCH=0
+普通CM/Data符号保护带 -> 三路均为0
+RS符号保护带          -> 当前补丁仍可能使RS发生器输出非零
+PSS符号               -> PSS通路未连接，三路均为0
+```
+
+如果资源标志错误重叠，或者某一路在无效期没有及时清零，按位 OR 会破坏符号；所以它能成立的前提是资源类型互斥并且无效通路归零。
+
+#### 4. 为什么先是 4095 点，再补成 4096 点
+
+`TX_Resource_Mapper_Top` 先产生：
+
+```text
+左保护带 248 点 + 有效子载波 3600 点 + 右保护带 247 点 = 4095 点
+```
+
+`side_495=1` 使左右495个位置的有效节拍继续存在。对普通CM/Data符号，这些位置不读FIFO且RS关闭，所以 `current_data=0`；但对RS符号，`TX_Resource_Mapper_Top` 第132～134行的补丁把 `side_space_delay7` 并入RS使能，RS发生器可能在这些位置按层间隔输出非零RS。因此“保护带恒为零”并不适用于当前RTL的RS符号。
+
+`DC_Insertion` 从一个 OFDM 符号开始计数，在前 2048 个输入点之后插入一个复数零，并把尚未输出的输入数据延迟一拍，避免因为插零丢掉原始数据。对普通CM/Data符号，最终 4096 点地址表为：
+
+```text
+输出索引       0..247      248..2047      2048      2049..3848      3849..4095
+内容           248个零     1800有效点      DC=0      1800有效点       247个零
+点数             248          1800           1          1800             247
+
+总点数 = 248 + 1800 + 1 + 1800 + 247 = 4096
+```
+
+因此 3600 是名义有效子载波数量，4096 才是后级变换点数。DC 位于零基输出索引 2048，也就是 4096 点数组的中间。对于RS符号，点数和DC位置不变，但左右495个位置可能被当前补丁写入交织RS，而不一定为零。
+
+#### 5. 最后为什么进入 WFRFT_TX
+
+补成 4096 点后，复数数据送入 `WFRFT_TX`。该模块构造四路基函数并按 `alpha` 选择/加权：原序列、FFT 分量、反序分量和 IFFT 分量。
+
+参考信号所在 OFDM 符号由 `WFRFT_Alpha_Indicate` 标出。控制信号经过 10000 拍对齐后，本模块强制给 `WFRFT_TX` 输入 `alpha=30`，使参考信号走纯 IFFT 分量；其他 OFDM 符号使用外部 `alpha`。
+
+```verilog
+.alpha(using_ifft_1W ? 6'd30 : alpha)
+```
+
+当前 `WFRFT_TX` 实际启用的 `case(alpha)` 只有三种结果：
+
+- `alpha=10`：只保留 FFT 分量；
+- `alpha=30`：只保留 IFFT 分量；
+- 其他值：只保留原始分量。
+
+原来更细的 0～39 阶加权系数表已经被整段注释，所以不能仅凭模块名假设当前 RTL 仍支持完整连续阶次 WFRFT。
+
+#### 6. 数据与 valid 如何对齐
+
+资源类型标志产生后，数据通路需要经过 FIFO 读取或 RS ROM 读取。代码给有效信号也补了相应延迟：
+
+```text
+资源映射标志
+   |-- FIFO读延迟/RS生成延迟 --> 数据归零选择 --> current_data
+   |
+   `-- middle_3600或side_495 --> long_4095 --> 延迟3拍 --> remove_DC_valid
+```
+
+`long_4095` 把 3600 个有效频域点和 495 个保护带点连成完整的 4095 拍有效区；再延迟 3 拍，用来对齐 FIFO/RS 数据进入 `current_data` 的寄存器路径。`fft_start_pulse` 也额外延迟 4 拍后送给 `DC_Insertion`，保证 DC 计数起点与数据流对齐。
 
 ### 子模块关系图
 
-```text
-Combine_Control_and_Data
-├─ WFRFT_Alpha_Indicate
-├─ TX_Resource_Mapper_Top
-├─ RS_need_code_Gen
-├─ FIFO_for_PDCCH_symbol
-├─ FIFO_for_PDSCH_symbol
-├─ DC_Insertion
-└─ WFRFT_TX
+```mermaid
+flowchart LR
+    PDCCH["PDCCH调制I/Q"] -->|"valid写入"| CFIFO["PDCCH FIFO<br/>32×4096"]
+    PDSCH["PDSCH调制I/Q"] -->|"valid写入"| DFIFO["PDSCH FIFO<br/>32×16384"]
+    START["start_of_symbol"] --> MAP["TX_Resource_Mapper_Top<br/>子帧/符号/子载波定位"]
+    MAP -->|"CM_flag读使能"| CFIFO
+    MAP -->|"Data_flag读使能"| DFIFO
+    MAP -->|"RS flags"| RS["RS_need_code_Gen"]
+    LAYER["layer_ID"] --> RS
+    CFIFO --> SEL["one-hot合成<br/>PDCCH/PDSCH/RS/0"]
+    DFIFO --> SEL
+    RS --> SEL
+    MAP --> GUARD["248+3600+247<br/>4095拍有效区"]
+    SEL --> DC["DC_Insertion<br/>中间补1个零"]
+    GUARD --> DC
+    DC --> WFRFT["WFRFT_TX<br/>4096点发送变换"]
+    ALPHA["alpha"] --> WFRFT
+    START --> MODE["WFRFT_Alpha_Indicate"]
+    MODE -->|"RS符号强制alpha=30"| WFRFT
+    WFRFT --> OUT["FFT_valid + I/Q输出"]
 ```
+
+从 `TX_BIT_Processor` 的层级看：
+
+```text
+PXSCH_TX_Bit_Processing_Top ---- PDSCH I/Q ----\
+                                                   Combine_Control_and_Data
+PDCCH_Transmitter_Top ---------- PDCCH I/Q ----/              |
+                                                                v
+                                                       单层发送复数流
+```
+
+#### 全部直接子模块逐个解读
+
+##### 1. `delay_1`：三条1-bit控制延时线
+
+本模块三次例化同一个移位寄存器：
+
+| 实例 | 输入→输出 | 延时 | 目的 |
+|---|---|---:|---|
+| `d0` | `using_ifft` → `using_ifft_1W` | 10000拍 | 把“当前是否为RS符号”的信息对齐到WFRFT后段系数选择 |
+| `delay_valid` | `long_4095` → `remove_DC_valid` | 3拍 | 对齐FIFO/RS数据进入 `current_data` 的寄存器路径 |
+| `delay_pulse` | `fft_start_pulse` → `fft_start_pulse_delay4` | 4拍 | 对齐DC插入模块的块起点与数据有效流 |
+
+`delay_1` 自身只是一个N位移位寄存器，每拍把输入移入最低位，从最高位取出延时后的控制信号。它不修改I/Q数据，只负责控制对齐。
+
+##### 2. `WFRFT_Alpha_Indicate`：找出必须使用纯IFFT的RS符号
+
+输入只有 `start_of_symbol`。内部再次例化 `Index_Generator` 得到子帧号和OFDM符号号，然后判定：
+
+```text
+任意子帧的符号0       -> using_ifft=1
+子帧0的符号7          -> using_ifft=1
+子帧0的符号3          -> using_ifft=1
+其他符号              -> using_ifft=0
+```
+
+这些位置正是当前资源表中的RS符号。输出 `using_ifft` 回到父模块后再延迟10000拍；到WFRFT四路分量加权时，父模块用它把 `alpha` 强制为30，只选择IFFT分量。
+
+##### 3. `TX_Resource_Mapper_Top`：产生每个频域位置的类型标签
+
+输入是 `start_of_symbol`；输出并不是实际I/Q，而是一组控制标签：
+
+```text
+middle_3600：当前位于名义3600个有效子载波
+side_495：当前位于左248或右247个位置
+CM_flag：读PDCCH FIFO
+Data_flag：读PDSCH FIFO
+RS_need_code_flag / RS_not_code_flag：启动RS发生器
+fft_start_pulse：通知一个4095点输入块开始
+```
+
+内部主要有四层：
+
+1. `Index_Generator`：每次 `start_of_symbol` 更新 `symbol_index`，14个符号后更新 `subframe_index`，并产生3600拍 `oCarrier` 和0～3599子载波索引；
+2. 两个 `PULSE_TO_STROBE_U16`：在开头产生248拍左侧区域，在 `248+3600=3848` 拍后产生247拍右侧区域；
+3. `TX_ChanID_Map`：根据子帧号和符号号选择RS、PSS、CM或Data；
+4. 多组 `delay_1/delay_n`：把索引、类型标志、左右区域和块起点对齐。
+
+`TX_ChanID_Map` 又包含：
+
+- `Data_Subframe_ChanID`：子帧1～9中，符号0为RS，符号1～13为Data；
+- `Special_Subframe_ChanID`：子帧0中，符号0/7为RS，符号3为另一类RS，符号2为PSS，符号8为CM，其余指定符号为Data。
+
+当前文件末尾还有“后期补丁”：在RS符号中，把 `side_space_delay7` 也并入RS使能；在PSS输出中也并入左右区域。因此 `side_495` 只是位置名称，并不保证RS符号中的数值一定为零。
+
+##### 4. `RS_need_code_Gen`：从ROM读取公共RS，并按12层做频率交织
+
+输入：
+
+```text
+enable = RS_need_code_flag | RS_not_code_flag
+layer_ID = 当前层编号
+```
+
+内部处理：
+
+1. `counter` 在 `enable=1` 时递增，作为 `ROM_for_RS_Frequency` 的地址；
+2. ROM每拍读出一个 `{RS_imag, RS_real}`；
+3. `Mod_N_Indexer` 按 `NUMBER_LAYER=12` 循环计数；
+4. `reset_value=12-layer_ID`，使不同层的 `index_zero` 出现在不同相位；
+5. 只有本层的 `index_zero_delay2=1` 时输出ROM中的RS，其余位置输出零。
+
+因此它不是每个子载波都给当前层输出RS，而是12层在频率位置上交织：
+
+```text
+位置： 0 1 2 3 ... 11 12 13 ...
+层0：  R 0 0 0 ...  0  R  0 ...
+层1：  0 R 0 0 ...  0  0  R ...
+...
+```
+
+父模块没有使用该发生器的 `output_valid`，而是依赖“非本层位置主动输出零”后与其他通路按位OR。
+
+##### 5. `FIFO_for_PDCCH_symbol`：缓存控制信道调制符号
+
+配置为同一时钟Block RAM标准FIFO，宽度32 bit、深度4096：
+
+```text
+写入：PDCCH_valid，每字={imag[15:0],real[15:0]}
+读取：CM_flag
+输出：PDCCH_data + PDCCH_valid_out
+```
+
+FIFO把PDCCH“提前编码调制的时间”与“子帧0符号8真正发送的时间”解耦。读取延迟标注为2拍，之后父模块再用 `PDCCH_data_fin` 打拍并在无效时清零。
+
+##### 6. `FIFO_for_PDSCH_symbol`：缓存数据信道调制符号
+
+接口与PDCCH FIFO相同，但深度为16384：
+
+```text
+写入：PDSCH_valid
+读取：Data_flag
+输出：PDSCH_data + PDSCH_valid_out
+```
+
+深度更大是因为PDSCH持续占用多个OFDM符号。两个FIFO的 `full` 都没有接入控制，`empty` 也没有形成读保护，正常工作依赖固定调度保证生产和消费数量匹配。
+
+##### 7. `DC_Insertion`：在4095点中间插入一个零
+
+输入是 `current_data`、`remove_DC_valid` 和对齐后的 `fft_start_pulse_delay4`。内部：
+
+1. `PULSE_TO_STROBE_U16(N=2048)` 标出前2048个输入点；
+2. `detect_negedge` 检测这段strobe结束；
+3. 下降沿那一拍强制输出 `real=0, imag=0, valid=1`；
+4. 同时预先保存输入数据，插零结束后从延迟寄存器恢复，避免丢掉原第2048号输入点。
+
+因此输出序列是：
+
+```text
+输入0～2047，DC零，输入2048～4094 = 4096点
+```
+
+##### 8. `WFRFT_TX`：构造四个变换分量并按alpha选择/加权
+
+它实现的结构可以写成：
+
+```text
+Y = w0·X0 + w1·X1 + w2·X2 + w3·X3
+```
+
+四个分量的代码来源：
+
+| 分量 | 代码实现 | 含义 |
+|---|---|---|
+| `X0` | 原始输入按正序从RAM读出 | 原序列 |
+| `X1` | `Normalization_FFT_wo_shift` | 4096点FFT分量 |
+| `X2` | 原始输入按地址 `4096-index` 反序读出 | 二阶/反序分量 |
+| `X3` | FFT结果在 `WFRFT_Multicarrier` 中反序读出 | IFFT等效分量 |
+
+数据进入后先右移 `factor=3` 做幅度预缩放。原始数据延迟 `SAVE_DELAY=2000` 拍后写入两块RAM，分别用于正序读取X0和反序读取X2；同时原始4096点进入 `Normalization_FFT_wo_shift`，其内部调用 `FFT_4096` IP并用 `over_under` 归一化、截位到16 bit。
+
+FFT输出进入 `WFRFT_Multicarrier`：同一组FFT结果正序读为X1，反序读为X3。FFT有效结束的下降沿产生 `X0_and_X2_start_pulse`，随后四路4096点开始同步输出。
+
+四个 `MUL_C16_C16` 分别计算 `wi·Xi`；八个 `over_under` 对四路实部/虚部乘积截位；随后实部四项相加、虚部四项相加，再用 `saturated_overflow` 饱和到16 bit。最后 `W_FFTshift` 让奇数索引取反、偶数索引不变，相当于乘以 `(-1)^n` 完成频谱中心搬移，并产生最终 `data_out_valid/real/imag`。
+
+当前真正生效的系数选择只有：
+
+```text
+alpha=10  -> w1=1，只输出X1（FFT分量）
+alpha=30  -> w3=1，只输出X3（IFFT分量）
+其他alpha -> w0=1，只输出X0（原序列）
+```
+
+完整0～39阶WFRFT系数表仍保留在文件中，但已经被注释；当前活动代码不会混合多个分量，`w2` 也不会被选中。
+
+##### FFT为什么要等4096点，为什么又反序读取FFT结果
+
+从数学上看，一个N点FFT输出为：
+
+```text
+X[k] = Σ x[n]·exp(-j2πkn/N)，n=0～N-1
+```
+
+任意一个 `X[k]` 都依赖整组N个输入点。某些流水FFT架构可以在内部计算与下一帧输入之间重叠，但仍然以完整N点为一个变换帧。当前工程的 `FFT_4096.xci` 明确配置为：
+
+```text
+transform_length       = 4096
+implementation_options = radix_4_burst_io
+output_ordering        = natural_order
+data_format            = fixed_point
+scaling_options        = unscaled
+```
+
+`radix_4_burst_io` 会先接收一帧4096个有效输入，再进行蝶形计算和自然顺序重排，随后成批输出。`Normalization_FFT_wo_shift` 注释标出的FFT核延时为10401拍，也说明它不是输入一拍、紧跟着下一拍立刻得到结果的简单组合模块。由于变换长度固定，即使代码把 `s_axis_data_tlast` 固定为0，FFT IP仍可按4096个 `valid_in` 样点自行计帧。
+
+FFT IP已经输出 `natural_order`，因此 `WFRFT_Multicarrier` 的反序读取并不是纠正FFT位倒序。代码有意构造四阶WFRFT的四个基分量：
+
+```text
+X0 = F^0{x} = x
+X1 = F^1{x} = FFT{x}
+X2 = F^2{x} = x[(-n) mod N]
+X3 = F^3{x} = IFFT{x}的等效形式（差一个归一化尺度）
+```
+
+对于N点DFT，FFT结果做循环反序满足：
+
+```text
+X1[(-n) mod N] = N·IFFT{x}[n]
+```
+
+所以代码把FFT结果先完整写入RAM，再用地址：
+
+```text
+n=0    -> 0
+n=1    -> 4095
+n=2    -> 4094
+...
+n=4095 -> 1
+```
+
+读出，得到 `X3`。这是一种循环反序 `(-n) mod 4096`，不是普通的 `4095-n` 整表倒放，因为0号点必须仍然是0号点。
+
+`WFRFT_Multicarrier` 第33行用FFT输出 `valid` 的下降沿产生 `start_pulse`：先等4096个FFT结果全部写完RAM，再同时正序读X1、反序读X3。当前 `alpha=30` 时只选X3，所以这条反序通路正是RS符号获得IFFT等效结果的关键。
+
+##### 通用基础子模块
+
+这些模块不承担无线帧业务，只服务于上述数据/控制路径：
+
+| 子模块 | 作用 |
+|---|---|
+| `delay_1` | 延时1-bit信号 |
+| `delay_n` | 延时多bit总线 |
+| `PULSE_TO_STROBE_U16` | 把单拍脉冲延长为N拍，并给出位置索引 |
+| `detect_negedge` | 检测长有效信号的下降沿 |
+| `Mod_N_Indexer` | 0～N-1循环计数，用于12层RS交织 |
+| `over_under` | 定点舍入、截位和溢出处理 |
+| `saturated_overflow` | 加法结果饱和到目标位宽 |
+| `W_FFTshift` | 对奇数点取反，实现 `(-1)^n` 搬移 |
 
 ### 关键代码解读
 
-`TX_Resource_Mapper_Top` 负责回答“当前资源粒子放什么”；两个FIFO负责回答“对应数据符号是什么”；参考信号发生器提供RS；随后插入DC并进入变换模块。
+#### 1. PDCCH FIFO：写入由调制器决定，读取由资源表决定
 
-3600表示有效子载波数量，不等于变换点数。`LEFT_SPACE`、`RIGHT_SPACE`、DC位置和4096点内部网格的精确关系需在本模块精读时建立地址表。
+```verilog
+.din   ({PDCCH_symbol_imag, PDCCH_symbol_real}),
+.wr_en (PDCCH_valid),
+.rd_en (CM_flag)
+```
+
+`PDCCH_valid` 表示“前级现在生产了一个 PDCCH 符号”；`CM_flag` 表示“频域网格现在需要一个 PDCCH 符号”。两者通常不是同时出现，这正是需要 FIFO 的原因。
+
+#### 2. PDSCH FIFO同理
+
+```verilog
+.din   ({PDSCH_symbol_imag, PDSCH_symbol_real}),
+.wr_en (PDSCH_valid),
+.rd_en (Data_flag)
+```
+
+`Data_flag` 在一个 PDSCH OFDM 符号的 3600 个有效子载波周期持续为高，因此 FIFO 按先进先出顺序连续吐出 3600 个调制符号。
+
+#### 3. 无效路清零让 OR 等效于选择器
+
+```verilog
+if (PDCCH_valid_out)
+    PDCCH_data_fin <= PDCCH_data;
+else
+    PDCCH_data_fin <= 32'd0;
+```
+
+PDSCH 通路也做相同处理，RS 发生器在非 RS 位置也输出零。这样三路按位 OR 时，理想状态下只有目标通路贡献非零数据。
+
+#### 4. 保护带也要保持 valid
+
+```verilog
+long_4095 <= middle_3600 || side_495;
+```
+
+左右495个位置仍然是4096点变换输入的一部分，所以不能简单把 `valid` 拉低。`side_495` 保证这些位置被后级计数；普通CM/Data符号在此输出零，RS符号则可能因资源映射补丁输出交织RS。
+
+#### 5. 当前 PSS 通路没有接入数据
+
+```verilog
+.PSS(),
+```
+
+`TX_Resource_Mapper_Top` 确实标出了子帧 0、符号 2 的 PSS 位置，但输出端口在本模块中悬空，`current_data` 也没有 PSS 数据源。因此当前代码在这个 OFDM 符号的 3600 个有效位置输出零。这是“资源标签存在，但实际序列源没有接入”，后续若要实现同步信号，需要补上 PSS 序列发生器及选择通路。
+
+#### 6. FIFO保护信号没有参与控制
+
+两个 FIFO 的 `full` 都未连接；PDCCH 的 `empty` 未连接；PDSCH 的 `empty` 只保留为内部观察信号，异常计数逻辑已经注释。当前模块没有完整反压和读空保护，而是依赖固定调度保证：写入足够早、容量足够、读取时 FIFO 中已有足够数据。
+
+这也是仿真时必须重点观察 `full/empty`、写入符号数和读取符号数的原因。
 
 ### 讨论问题
 
-1. 信号名 `FFT_valid/FFT_symbol` 是接口历史命名，不能单凭名字断言方向；当前实际最后一级是 `WFRFT_TX`。
-2. `using_ifft` 被固定延迟10000拍，说明变换模式还有一条独立控制时序，需要结合 `alpha` 和WFRFT内部状态核实。
-3. 本模块是下一阶段最重要的时频连接点，应重点建立“符号索引×子载波索引→PDCCH/PDSCH/RS/DC/保护带”的表。
+1. **两个 FIFO 到底在哪？** 都在 `Combine_Control_and_Data.v` 内部直接例化，不在 `PDCCH_Transmitter_Top` 或 `PXSCH_TX_Bit_Processing_Top` 内。前级只提供 I/Q 和写有效信号。
+2. **FIFO里存的是bit吗？** 不是。每个 32-bit FIFO 字是一个已经调制好的复数符号 `{Q[15:0], I[15:0]}`。
+3. **为什么需要两个FIFO？** PDCCH/PDSCH生成符号的时刻与它们真正占用资源网格的时刻不同；FIFO负责缓存和解耦生产者、消费者。
+4. **为什么 PDSCH FIFO 比 PDCCH FIFO 大？** PDCCH 当前一帧只占一个 3600 子载波 OFDM 符号，而 PDSCH 占多个 OFDM 符号，待缓存数据量更大。
+5. **`CM_flag` 和 `Data_flag` 是一个脉冲吗？** 不是单拍触发。它们在对应 OFDM 符号的 3600 个有效子载波期间连续为高，每拍从对应 FIFO 读一个复数符号。
+6. **为什么用 OR 而不用 case/mux？** 因为作者让未选中的通路输出零，使按位 OR 在资源类型互斥时等价于多路选择。但显式 `case` 或 mux 可读性和容错性会更好。
+7. **3600、4095、4096分别是什么？** 3600 是有效子载波数；加左右 495 个保护带得到 4095；再插入一个 DC 零点得到 4096 点变换输入。
+8. **PSS现在真的发了吗？** 按当前 `Combine_Control_and_Data` RTL，没有。PSS 标签产生了，但数据端口未连接，所以相应有效子载波为零。
+9. **输出一定是普通 IFFT 吗？** 不一定。最后一级是 `WFRFT_TX`；RS符号强制 `alpha=30` 走 IFFT，其他符号由外部 `alpha` 决定。接口名 `FFT_*` 是历史命名。
+10. **当前最明显的工程风险是什么？** FIFO `full/empty` 没有形成保护闭环；如果前级写入数量或时序不符合固定调度，可能发生溢出、读空或符号错位。
 
 ## 1.9 Invalidate_Layer_Streams
 
