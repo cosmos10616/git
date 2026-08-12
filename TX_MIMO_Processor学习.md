@@ -20,6 +20,238 @@
 
 它的名字叫 `MIMO_Processor`，但当前有效的 `TX_Precoding_Direct` **没有执行**常见的预编码矩阵乘法 `x=W·s`，也没有权重输入。工程中另有支持权重和复数点积的 `TX_Precoding.v`，但当前顶层没有例化它。
 
+## 0. MIMO处理结束总览：从12条Layer到两路32天线数据
+
+一句话先定住：`TX_MIMO_Processor`从 `FIFO_Manager`读取同一个内部RB块的12条Layer数据，每次处理4个连续位置，按当前固定规则展开为32根天线，再拆成前后两组并转换成两路64-bit FIFO数据。
+
+### 0.1 主数据流与控制流大图
+
+```mermaid
+flowchart LR
+    subgraph U["上游：BIT→MIMO交换与FIFO_Manager"]
+        F0["FPGA0贡献3条Layer"]
+        F1["FPGA1贡献3条Layer"]
+        F2["FPGA2贡献3条Layer"]
+        F3["FPGA3贡献3条Layer"]
+        FM["四个64→128位FIFO<br/>按源FPGA各读3次<br/>汇集完整12条Layer"]
+        F0 & F1 & F2 & F3 --> FM
+    end
+
+    subgraph M["TX_MIMO_Processor"]
+        T["① MIMO_TX_Trigger<br/>检查输入数据与输出空间<br/>产生RB启动和计数"]
+
+        subgraph R0["② MIMO_Processor_Payload_Reader"]
+            PG["Payload_Read_Pattern_Generator<br/>每4位置分配44拍：前12拍读Layer<br/>其余32拍不发起下一组读取；共3组"]
+            R["读取并转发FIFO数据<br/>每拍128 bit"]
+            PG -->|read_fifo| R
+        end
+
+        D["③ TX_Precoding_Direct<br/>不做矩阵乘法<br/>12条Layer固定重复成32天线行"]
+        S["④ Submatrix_Splitter<br/>双页RAM缓存32行<br/>A0,A1,A16,A17…交替读出"]
+        P0["⑤ MIMO_TX_Pack_Data0<br/>前16根天线<br/>2×128→4×64"]
+        P1["⑤ MIMO_TX_Pack_Data1<br/>后16根天线<br/>2×128→4×64"]
+
+        T -. "RB_trigger / last_RB / RB_index" .-> PG
+        R -. "RB_available反馈" .-> T
+        R -->|"12拍：12 Layer×4位置<br/>每拍128 bit"| D
+        D -->|"32拍：32天线×4位置<br/>每拍128 bit"| S
+        S -->|"splitter_data 128 bit<br/>valid0：A0～A15"| P0
+        S -->|"splitter_data 128 bit<br/>valid1：A16～A31"| P1
+    end
+
+    FM -->|"payload_data_in 128 bit<br/>一条Layer×4个复数"| R
+    R -->|read_payload_fifo| FM
+    FM -->|"payload_fifo_used_number<br/>普通块够36个字"| T
+
+    P0 -->|"fifo_data_0 64 bit<br/>每个完整块96个U64"| O0["MIMO→RRH逻辑流0<br/>前16根天线"]
+    P1 -->|"fifo_data_1 64 bit<br/>每个完整块96个U64"| O1["MIMO→RRH逻辑流1<br/>后16根天线"]
+
+    C["当前顶层容量输入<br/>number_element_fifo1/2=200"] -. "允许启动" .-> T
+
+    classDef control fill:#dbeafe,stroke:#2563eb,color:#111827;
+    classDef data fill:#dcfce7,stroke:#16a34a,color:#111827;
+    classDef reorder fill:#f3e8ff,stroke:#9333ea,color:#111827;
+    classDef ext fill:#f8fafc,stroke:#64748b,color:#111827;
+    class T,PG control;
+    class R,D data;
+    class S,P0,P1 reorder;
+    class F0,F1,F2,F3,FM,O0,O1,C ext;
+```
+
+图中要分清两股信息：
+
+1. 蓝色控制流只决定“什么时候启动、读多少拍、当前是哪个块”，不承载I/Q数据；
+2. 绿色和紫色数据流完成 `12 Layer → 32天线 → 两路64 bit` 的组织变化。
+
+### 0.2 关键数据形状变化
+
+```mermaid
+flowchart TB
+    A["一个完整内部RB块<br/>12 Layer × 12位置<br/>144个复数"]
+    A --> B0["子矩阵0<br/>12 Layer × 位置0～3<br/>12个128-bit字"]
+    A --> B1["子矩阵1<br/>12 Layer × 位置4～7<br/>12个128-bit字"]
+    A --> B2["子矩阵2<br/>12 Layer × 位置8～11<br/>12个128-bit字"]
+
+    B0 --> C["每个子矩阵进入Direct<br/>12 Layer × 4位置"]
+    C --> D["Direct输出<br/>32天线 × 4位置<br/>32个128-bit字"]
+    D --> E0["Splitter逻辑流0<br/>A0～A15 × 4位置"]
+    D --> E1["Splitter逻辑流1<br/>A16～A31 × 4位置"]
+    E0 --> F0["Pack0<br/>32个U64/子矩阵"]
+    E1 --> F1["Pack1<br/>32个U64/子矩阵"]
+    F0 --> G0["三个子矩阵合计<br/>96个U64/完整块"]
+    F1 --> G1["三个子矩阵合计<br/>96个U64/完整块"]
+```
+
+数量闭合：
+
+```text
+Reader输入：
+12 Layer × 12位置 = 144个复数
+144 ÷ 每个128-bit字的4个复数 = 36个128-bit字
+
+Direct输出：
+32天线 × 12位置 = 384个复数
+
+两路Pack输出：
+384 ÷ 每个U64的2个复数 = 192个U64
+前16根96个U64 + 后16根96个U64 = 192个U64
+```
+
+### 0.3 五种直接子模块的关键作用
+
+| 模块 | 吃进去什么 | 实际只做什么 | 吐出来什么 |
+|---|---|---|---|
+| `MIMO_TX_Trigger` | 使能、Reader数据足够、两路容量信息 | 判断能否启动；维护RB/OFDM符号计数；产生132拍忙窗口 | `RB_trigger`、`last_RB`、`RB_index`等控制信号 |
+| `MIMO_Processor_Payload_Reader` | FIFO余量、128-bit FIFO返回数据、RB启动 | 普通块按三段12拍读取；数据原样寄存输出 | 12条Layer的128-bit数据流及valid |
+| `Payload_Read_Pattern_Generator` | `RB_trigger`、`last_RB` | 产生 `[12拍读取+32拍不读]×3`；最后4位置块只运行一轮 | `read_fifo`图样 |
+| `TX_Precoding_Direct` | 12拍Layer0～11，每拍为一条Layer×4位置 | 用1/13/25拍延迟抽头固定复制；不做权重计算 | 32拍天线0～31，每拍为一根天线×4位置 |
+| `Submatrix_Splitter` | 连续32个128-bit天线行 | 双页RAM缓存；按 `A0,A1,A16,A17...` 重排；用两个valid分流 | 前16根和后16根两条逻辑流，共享128-bit总线 |
+| `MIMO_TX_Pack_Data ×2` | 每套连续接收两根天线，即2个128-bit字 | 拼成256 bit，再从低位到高位拆成4个U64 | 两路64-bit FIFO数据和写使能 |
+
+这里是五种模块类型，但顶层共有六个数据处理实例，因为 `MIMO_TX_Pack_Data`例化了两套。
+
+### 0.4 一个四位置子矩阵的完整旅行
+
+假设当前处理RB中的位置0～3：
+
+```text
+FIFO_Manager输出12拍：
+L0[0..3], L1[0..3], ... L11[0..3]
+
+TX_Precoding_Direct输出32拍：
+A0[0..3], A1[0..3], ... A31[0..3]
+
+Submatrix_Splitter重排：
+A0, A1, A16, A17, A2, A3, A18, A19, ... A14, A15, A30, A31
+
+Pack0接收：
+A0,A1 → A2,A3 → ... → A14,A15
+
+Pack1接收：
+A16,A17 → A18,A19 → ... → A30,A31
+
+每套Pack对每两根天线输出4个U64：
+第一根位置0/1 → 第一根位置2/3 → 第二根位置0/1 → 第二根位置2/3
+```
+
+位置4～7和位置8～11再各执行一次相同过程，三次合起来才是一个完整12位置内部RB块。
+
+### 0.5 读图时最容易混淆的四点
+
+1. `12`是Layer数量，也是一个RB的位置数量，但属于不同维度；输出天线数量是32，不是12；
+2. 一个128-bit字表示“一条Layer或一根天线 × 4个位置”，不是一个完整RB；
+3. `TX_Precoding_Direct`当前只是复制Layer，不是真正的 `x=W·s`预编码；
+4. `44=12+32`是相邻四位置子矩阵的读取启动间隔；输入12拍与Direct输出32拍会流水重叠，不应画成完全串行。
+
+### 0.6 为什么是12拍、32拍、44拍和132拍
+
+先说最准确的结论：这些数字描述的是RTL设计者给数据流水线安排的**固定调度槽**，不是无线协议规定的时间长度。
+
+#### 12拍从哪里来
+
+一次处理4个位置时，Reader需要收齐12条Layer。FIFO每拍只能给出一条Layer的128-bit行，所以：
+
+```text
+拍0  读取Layer0在这4个位置上的数据
+拍1  读取Layer1在这4个位置上的数据
+...
+拍11 读取Layer11在这4个位置上的数据
+
+12条Layer ÷ 每拍1条Layer = 12拍读取
+```
+
+#### 32拍从哪里来
+
+同一个四位置子矩阵经过MIMO处理后，要形成32根天线的行数据；下游接口每拍处理一根天线行，因此设计按32根天线预留32拍的后级处理规模：
+
+```text
+天线A0、A1、...、A31
+32根天线 ÷ 每拍1根 = 32拍
+```
+
+这32拍在Reader端表现为 `read_fifo=0`，含义只是Reader暂时不发起下一组读取，不代表整个MIMO模块空闲。Direct、Splitter和Pack仍可在这段时间工作。
+
+#### 44拍是什么
+
+代码直接定义：
+
+```verilog
+`define ROW_PER_QR 6'd44
+```
+
+并让每个44拍槽只有前12拍满足 `rows_index<12`，所以波形是：
+
+```text
+一个四位置调度槽，共44拍
+
+拍0～11  ：Reader读取12条Layer
+拍12～43 ：Reader不读取下一组，后级继续处理
+
+44 = 12 + 32
+```
+
+因此“停32拍”更准确的说法是“在44拍槽的剩余32拍不再读FIFO”。在当前 `TX_Precoding_Direct` 中输入和输出存在流水重叠，所以不能把它解释成严格完成12拍输入以后，才从零开始执行32拍输出。
+
+结合NI原手册可以推断，这个44拍槽继承了原始真实预编码器的调度思想：先收齐 `12 Layer×4位置` 子矩阵，再为32个天线行的产生留出处理时间。F0把真实预编码替换成了Direct固定复制，但保留了44拍调度参数，因此当前实现可能比Direct本身实际所需更保守。
+
+#### 132拍是什么
+
+一个完整内部RB块有12个位置，而每次只能处理4个位置：
+
+```text
+位置0～3   → 第1个44拍槽
+位置4～7   → 第2个44拍槽
+位置8～11 → 第3个44拍槽
+
+12位置 ÷ 每组4位置 = 3组
+3组 × 每组44拍 = 132拍
+```
+
+完整时间轴：
+
+```text
+拍0～11    读位置0～3的12条Layer
+拍12～43   Reader不读
+
+拍44～55   读位置4～7的12条Layer
+拍56～87   Reader不读
+
+拍88～99   读位置8～11的12条Layer
+拍100～131 Reader不读
+
+拍132以后才允许启动下一个内部RB块
+```
+
+所以132拍中：
+
+```text
+真正读FIFO：36拍 = 12×3
+Reader不读：96拍 = 32×3
+总调度时间：132拍
+```
+
+`MIMO_TX_Trigger`把自己锁为忙状态132拍，是为了在这三个子矩阵处理完成前不重复启动下一个RB。最后只有4个剩余位置的不完整块只需要一个44拍槽。
+
 ### 与《MIMO 1.1 Manual》的关系
 
 现在可以确认：本工程明显参考了 NI 的 **LabVIEW Communications MIMO Application Framework 1.1**。不是只有模块名称相似，连数据矩阵尺寸、RB拆分方式、触发条件和双输出结构都一一对应。
@@ -627,11 +859,78 @@ read_fifo
 
 这里的“FIFO返回4拍”不在本模块内部实现。`TX_MIMO_Processor` 顶层把 `read_payload_fifo` 延迟4拍后接到 `fifo_data_in_valid`，因此这是一项必须由外部FIFO接口满足的固定时序约定。
 
+#### 为什么把read_fifo延迟4拍又作为fifo_data_in_valid返回
+
+这不是把读请求反馈回来重新读取，而是用读请求的延迟副本给返回数据生成valid标签。三个信号虽然脉冲形状相同，但含义不同：
+
+```text
+read_fifo             现在向上游FIFO发出一次读取请求
+fifo_data_in_valid    四拍后，假定这次请求对应的fifo_data已经返回
+data_out_valid        父模块再寄存一拍后，data_out现在可供Direct使用
+```
+
+完整路径为：
+
+```mermaid
+flowchart LR
+    R["read_payload_fifo<br/>读取请求"] --> F["MIMO_TX_Top与FIFO_Manager<br/>固定4拍返回路径"]
+    F --> D["payload_data_in<br/>128-bit返回数据"]
+    R --> V["delay_1延迟4拍"]
+    V --> VI["fifo_data_in_valid"]
+    D --> O["Reader输出寄存器"]
+    VI --> O
+    O --> Q["data_out + data_out_valid"]
+```
+
+`MIMO_TX_Top`中，这条四拍返回路径包含：先把读请求延迟1拍以等待 `src_mimo_from_bit_fifo_id`选择完成，再读取四个64→128位FIFO中的一路，最后在 `FIFO_Manager` 中根据各路FIFO的真实valid把数据寄存到 `tx_mimo_payload_data`。上层没有把选中FIFO的真实valid端口继续传给Reader，而是约定从请求到 `payload_data_in`固定延迟4拍。
+
+父模块中的最后一拍寄存也有必要，因为数据和valid都要同时穿过输出寄存器：
+
+```verilog
+data_out_valid <= fifo_data_in_valid;
+data_out       <= fifo_data;
+```
+
+如果 `data_out`寄存一拍、valid却不寄存，那么valid会比对应数据早一拍。
+
+可以把它理解为：
+
+```text
+read_fifo          = 取货单
+delay4后的valid    = 预计四拍后货物到达的标签
+data_out_valid     = 货物进入Reader输出寄存器后的可用标签
+```
+
+这是一种依赖确定性延迟的简化设计。它的风险是：如果更换FIFO IP、修改FIFO输出寄存器或改变 `FIFO_Manager`流水线，使实际返回延迟不再是4拍，`fifo_data`就会与人工生成的valid错位。更稳健的做法是把被选中FIFO的真实 `valid`随 `payload_data_in`一起传入Reader，而不是从读请求推算valid。
+
 #### 32拍低电平到底表示什么
 
-不能把它机械理解成“先把12拍全部读完，再从头开始串行输出32根天线”。当前流水线中，`TX_Precoding_Direct`在第一组输入开始到达后便会启动32拍输出，输入和输出会重叠。
+先只看Reader，不看后级。它把处理一个四位置小块的时间格固定为44拍：
 
-准确说法是：`Payload_Read_Pattern_Generator`把相邻两个四位置子矩阵的**输入起点固定间隔为44拍**。其中前12拍允许输入12条Layer，后32拍不再发起下一组读取，使后级32天线展开、拆分和打包流水线有足够处理时间。
+```text
+相对拍号        0........11  12................43  44........55
+read_fifo       111111111111  00000000000000000000000000000000  111111111111
+读到的内容       第1组12条Layer       不读取             第2组12条Layer
+```
+
+因此三个数字的第一层含义只有：
+
+```text
+44 = Reader给一个四位置小块分配的总时间格
+12 = 这个时间格中真正读取FIFO的拍数，因为有12条Layer
+32 = 其余不读取FIFO的拍数，即44-12
+```
+
+再把后级放回来：`TX_Precoding_Direct`检测到第一条Layer开始到达后，经过流水线延迟便开始连续产生32个天线行。这个32拍输出窗口会与Reader的“前12拍读取”和“后32拍不读”发生重叠，并不是严格从Reader第12拍结束后才开始。
+
+```text
+Reader输入：  [读Layer0～11] [不再读本组数据................] [下一组]
+Direct输出：      [天线0～31连续输出，和上面发生重叠......]
+```
+
+所以“32根天线”和“Reader低电平32拍”数值相同，反映了当前下游按32个天线行处理的调度规模，但不能把二者逐拍硬连成“低电平第0拍一定输出天线0”。中间还有Reader、FIFO和Direct的寄存延迟。
+
+最准确、也最应该记住的结论是：**相邻两组四位置数据的读取起点相隔44拍。每次起点之后，Reader只用前12拍取齐12条Layer；在下一个起点到来前，后级流水线完成这组数据向32个天线行的展开和转发。**
 
 #### 这个模块依赖的前提
 
@@ -1041,3 +1340,669 @@ Reader读请求      ████████████____________________
 ```
 
 并不是数学上必须把“12拍输入”和“32拍输出”完全不重叠地相加。
+
+## 3. TX_Precoding_Direct
+
+### 一句话功能
+
+它把连续输入的12条Layer行保存成三个相隔12拍的数据副本，再按固定规则输出32个“天线行”；它没有权重输入，也不做乘法、加法或真正的MIMO预编码。
+
+### 输入是什么
+
+```text
+input_valid       一组四位置子矩阵的12条Layer正在连续输入
+data_in[127:0]    当前一条Layer的4个复数位置
+```
+
+一个128-bit输入字的排列为：
+
+```text
+data_in[31:0]    = 位置0：{imag0[15:0], real0[15:0]}
+data_in[63:32]   = 位置1：{imag1[15:0], real1[15:0]}
+data_in[95:64]   = 位置2：{imag2[15:0], real2[15:0]}
+data_in[127:96]  = 位置3：{imag3[15:0], real3[15:0]}
+```
+
+连续12个有效输入字应依次为：
+
+```text
+第0拍：L0 = Layer0的4个复数
+第1拍：L1 = Layer1的4个复数
+...
+第11拍：L11 = Layer11的4个复数
+```
+
+### 中间实际只做哪几步
+
+#### 第一步：检测一组输入的起点
+
+`detect_posedge`只检测 `input_valid` 从0变1的第一拍。即使 `input_valid` 连续保持12拍，也只产生一个 `input_valid_rising` 启动脉冲。
+
+#### 第二步：产生32拍输出窗口和天线索引
+
+`PULSE_TO_STROBE_U16_delay1`把启动脉冲展开为 `NUMBER_ANTENNA=32` 拍有效窗口，同时输出：
+
+```text
+index = 0,1,2,...,31
+```
+
+这里的 `index` 可以直接理解为当前正在生成的输出天线行编号。
+
+#### 第三步：制造三份相隔12拍的数据
+
+```verilog
+data_in_delay1  <= data_in;
+delay_n #(12,128) d1(data_in_delay1, data_in_delay13);
+delay_n #(12,128) d2(data_in_delay13, data_in_delay25);
+```
+
+三个抽头的含义为：
+
+```text
+data_in_delay1   当前12条Layer流的第一份
+data_in_delay13  第一份再延迟12拍，重新得到L0～L11
+data_in_delay25  再延迟12拍，第三次得到L0～L11
+```
+
+名字中的1、13、25表示相对原始 `data_in` 的累计寄存延迟。真正重要的是三个抽头彼此相差12拍。
+
+#### 第四步：按天线索引选择延迟抽头
+
+```text
+index 0～11   → 选择data_in_delay1  → L0～L11
+index 12～23  → 选择data_in_delay13 → L0～L11再次重复
+index 24～31  → 选择data_in_delay25 → L0～L7再次重复
+```
+
+因此完整映射为：
+
+| 输出天线行 | 实际复制的输入Layer |
+|---|---|
+| 天线0～11 | Layer0～11 |
+| 天线12～23 | Layer0～11 |
+| 天线24～31 | Layer0～7 |
+
+用字母表示最直观：
+
+```text
+输入12拍：
+L0 L1 L2 L3 L4 L5 L6 L7 L8 L9 L10 L11
+
+输出32拍：
+L0 L1 L2 L3 L4 L5 L6 L7 L8 L9 L10 L11
+L0 L1 L2 L3 L4 L5 L6 L7 L8 L9 L10 L11
+L0 L1 L2 L3 L4 L5 L6 L7
+```
+
+### 子模块关系图
+
+```mermaid
+flowchart LR
+    V["input_valid"] --> E["detect_posedge<br/>只取上升沿"]
+    E --> S["32拍strobe与index 0～31"]
+    D["12条Layer输入<br/>每条128 bit"] --> D1["delay1"]
+    D1 --> D13["再延迟12拍"]
+    D13 --> D25["再延迟12拍"]
+    S --> M["按index选择抽头"]
+    D1 --> M
+    D13 --> M
+    D25 --> M
+    M --> O["32个天线行<br/>data_out"]
+```
+
+### 输出是什么
+
+```text
+data_out_valid    连续32拍，说明当前输出天线行有效
+data_out[127:0]   当前天线在同一组4个位置上的4个复数
+```
+
+输出仍然是一拍一个128-bit行。输入侧一行代表Layer，输出侧一行被后级解释为天线。
+
+### 整体实现了什么功能
+
+```text
+输入布局：12条Layer × 4个位置
+输出布局：32根天线 × 4个位置
+```
+
+但这个“12层到32天线”的变化只是重复和改标签：
+
+```text
+x_ant[0..11]  = s_layer[0..11]
+x_ant[12..23] = s_layer[0..11]
+x_ant[24..31] = s_layer[0..7]
+```
+
+标准预编码应当为：
+
+```text
+x = W · s
+
+每根天线的数据通常是12条Layer按不同复数权重相乘后求和
+```
+
+本模块没有 `weight_in`，因此不能根据无线信道形成波束，也不能抑制层间干扰。工程中的另一份 `TX_Precoding.v` 才具有 `weight_in[599:0]` 和点积计算结构，但当前 `TX_MIMO_Processor` 没有例化它。
+
+### 关键代码解读
+
+32拍输出窗口：
+
+```verilog
+PULSE_TO_STROBE_U16_delay1 pulse2strobe_1(
+    .start_pulse(input_valid_rising),
+    .N(NUM_ANTENNA),
+    .strobe(output_valid_ahead),
+    .index(index)
+);
+```
+
+三个固定映射区间：
+
+```verilog
+if(index[4:0] < 5'd12)
+    data_out <= data_in_delay1;
+else if(index[4:0] > 5'd23)
+    data_out <= data_in_delay25;
+else
+    data_out <= data_in_delay13;
+```
+
+也就是：
+
+```text
+0～11、12～23、24～31
+```
+
+### 关键时序
+
+顶层注释将本模块标为2拍延迟。`input_valid`上升沿启动32拍内部窗口；`data_out`和 `data_out_valid`又分别经过输出寄存，所以有效输出相对输入起点存在寄存延迟，但一旦开始便连续输出32拍。
+
+它与Reader流水重叠：
+
+```text
+Reader： [L0 L1 ... L11] [不读取........................]
+Direct：     [A0 A1 ... A31连续输出................]
+```
+
+下一组12条Layer在44拍后才开始，而本模块的32拍输出窗口已经结束，因此 `PULSE_TO_STROBE_U16_delay1` 有时间返回等待状态，满足其“输出结束后至少等待一拍再启动”的要求。
+
+### 代码风险和容易误解的地方
+
+1. `data_out`注释写成18.29定点格式是遗留错误。模块没有数学运算或位宽扩展，输出与输入逐位相同，仍应按输入的4个16-bit I/Q复数解释。
+2. `scaled_data`这个上层连线名也容易误导；当前Direct没有做缩放。
+3. `input_valid`只用于检测一组数据的开始，没有逐拍控制延迟线；设计强依赖输入恰好连续12拍且顺序为Layer0～11。
+4. 如果12拍输入中间断流，延迟线仍会移位，之后的天线与Layer映射会错位。
+5. `data_out`本身没有复位清零要求；无效期间可能保留旧数据，后级必须以 `data_out_valid`为准。
+
+### 讨论问题：payload_data_valid必须连续12拍吗
+
+沿当前有效RTL连接追踪后，结论是：**数据必须连续传12拍，但 `payload_data_valid` 本身不必连续为高12拍；只在L0到达时给一个单拍脉冲，当前 `TX_Precoding_Direct`也能完成任务。**
+
+原因是 `payload_data_valid`只接到 `TX_Precoding_Direct.input_valid`，Direct内部对它的唯一使用是：
+
+```verilog
+detect_posedge dpos_0(clk,rst_n,input_valid,input_valid_rising);
+```
+
+也就是说，Direct只关心0→1上升沿，用它启动32拍输出窗口。延迟线则无条件每拍移入 `data_in`：
+
+```verilog
+always @(posedge clk) data_in_delay1 <= data_in;
+```
+
+所以以下两种valid波形对当前Direct的功能等价，只要 `data_in`仍然连续提供L0～L11：
+
+```text
+方案A，当前实现：
+data_in：       L0 L1 L2 ... L11
+input_valid：   1  1  1  ... 1
+上升沿脉冲：    1  0  0  ... 0
+
+方案B，单拍也能工作：
+data_in：       L0 L1 L2 ... L11
+input_valid：   1  0  0  ... 0
+上升沿脉冲：    1  0  0  ... 0
+```
+
+两者都会在L0处产生同一个启动上升沿；后面的L1～L11仍会被无条件移入1/13/25拍延迟线。
+
+必须区分两个结论：
+
+```text
+12个128-bit数据字     必须占12拍传完
+控制Direct开始的信号   当前只需要1拍
+```
+
+因此，当前信号名 `payload_data_valid`从接口语义看像逐拍数据valid，但在Direct内部实际被当成 `submatrix_start`使用。连续12拍高电平主要来自Reader把FIFO每一拍返回有效都原样标记出来，便于表达和观察数据窗口；对当前Direct的运算控制不是必需的。
+
+风险在于Direct完全依赖固定时序：若L0之后的数据中断、插入空拍或顺序变化，即使valid指出无效，延迟线仍会继续移位并造成Layer到天线映射错位。更清晰的设计有两种：
+
+1. 将端口明确改名为 `submatrix_start`，规定脉冲后固定连续接收12拍数据；
+2. 保留真正的逐拍 `input_valid`，并用它控制数据移位和Layer计数，从而允许数据停顿。
+
+## 4. Submatrix_Splitter
+
+### 一句话功能
+
+它先把Direct连续输出的32个天线行存入双页RAM，再按照“前半两根、后半两根”交替读出；数据只有一条128-bit总线，通过两个valid把天线0～15和天线16～31分别送给后面的两套Pack模块。
+
+### 输入是什么
+
+```text
+data_in_valid       连续32拍，表示32个天线行正在输入
+data_in[127:0]      当前一根天线在4个连续位置上的4个复数
+```
+
+输入顺序来自 `TX_Precoding_Direct`：
+
+```text
+A0, A1, A2, ... A31
+```
+
+其中每个 `A` 都是一个128-bit字：
+
+```text
+一根天线 × 4个复数位置
+```
+
+### 中间实际只做哪几步
+
+#### 第一步：连续写入32个天线行
+
+`antanan_counter`在 `data_in_valid=1`时按0～31计数，32个输入依次写入RAM当前页：
+
+```text
+地址0  ← A0
+地址1  ← A1
+...
+地址31 ← A31
+```
+
+第32个天线行写完时产生 `submatrix_complete`。
+
+#### 第二步：切换双页RAM
+
+RAM共有64个128-bit地址，可理解为两页：
+
+```text
+Page0：32个地址，保存一个四位置子矩阵的32根天线
+Page1：32个地址，保存下一个四位置子矩阵的32根天线
+```
+
+写完一页后，下一组数据改写另一页；同时从刚刚写完的页读出。这样后续可以一边写下一组，一边读上一组，避免读写同一页冲突。
+
+#### 第三步：将前16根和后16根交替读出
+
+模块不是先读完前16根再读后16根，而是每次各取两根：
+
+```text
+A0,  A1,  A16, A17,
+A2,  A3,  A18, A19,
+A4,  A5,  A20, A21,
+...
+A14, A15, A30, A31
+```
+
+整个读出仍然是32拍。
+
+#### 第四步：用两个valid标记数据属于哪一路
+
+```text
+data_out_0_valid=1 → 当前data_out属于前16根天线
+data_out_1_valid=1 → 当前data_out属于后16根天线
+```
+
+对应波形为：
+
+```text
+共享data_out： A0 A1 A16 A17 A2 A3 A18 A19 ... A14 A15 A30 A31
+valid0：        1  1  0   0   1  1  0   0  ... 1   1   0   0
+valid1：        0  0  1   1   0  0  1   1  ... 0   0   1   1
+```
+
+### 子模块关系图
+
+```mermaid
+flowchart LR
+    D["Direct输出<br/>A0～A31连续32拍"] --> W["写入双页RAM"]
+    W --> R["按2+2方式重新读出"]
+    R --> B["共享128-bit data_out"]
+    R --> V0["valid0<br/>前16根"]
+    R --> V1["valid1<br/>后16根"]
+    B --> P0["MIMO_TX_Pack_Data0"]
+    B --> P1["MIMO_TX_Pack_Data1"]
+    V0 --> P0
+    V1 --> P1
+```
+
+### 输出是什么
+
+```text
+data_out[127:0]       当前读出的一个天线行，仍含4个复数
+data_out_0_valid      当前行送给前16天线Pack模块
+data_out_1_valid      当前行送给后16天线Pack模块
+```
+
+注意：这里只有一条 `data_out`数据总线，不是两条128-bit数据总线。两个valid负责进行逻辑分流。
+
+### 整体实现了什么功能
+
+```text
+输入：一条连续的32天线数据流
+
+输出逻辑流0：A0～A15
+输出逻辑流1：A16～A31
+```
+
+物理实现上，两条逻辑流复用同一条128-bit总线，以两拍为一组交替出现。这样后面的两套 `MIMO_TX_Pack_Data` 都能连续拿到两根天线的128-bit数据，并分别打包到两路64-bit FIFO。
+
+### 先记住的关键代码
+
+32根天线写完的判断：
+
+```verilog
+Mod_N_Indexer #(...) Mod_N_0(
+    .N(`NUMBER_ANTENNA),
+    .enable(data_in_valid),
+    .wrap_back(submatrix_complete)
+);
+```
+
+两个valid每两拍切换一次：
+
+```verilog
+page0_select <= antanna_strobe && (page_counter < 8'd2);
+page1_select <= antanna_strobe && (page_counter >= 8'd2);
+```
+
+先不用深究 `read_page_switching`、`fifo_select` 和四种读地址拼接；它们合起来只是在完成两件事：选择刚写完的RAM页，以及按 `A0,A1,A16,A17...` 的顺序产生读地址。
+
+### 讨论问题：连续两个128-bit表示什么
+
+连续两个128-bit表示**两根天线各自的4个复数位置**，不是一根天线的8个复数位置。对于当前同一个四位置子矩阵：
+
+```text
+第1个128-bit：A0在位置k、k+1、k+2、k+3上的4个复数
+第2个128-bit：A1在位置k、k+1、k+2、k+3上的4个复数
+
+合计：2根天线 × 每根4个复数 = 8个复数 = 256 bit
+```
+
+Splitter共享总线的开头顺序为：
+
+```text
+A0的[k..k+3]
+A1的[k..k+3]
+A16的[k..k+3]
+A17的[k..k+3]
+```
+
+所以这里连续两拍是在切换天线维度，四个位置不变。某一根天线的下一组4个位置 `k+4..k+7` 要等下一个四位置子矩阵到来，不能把A0和A1两拍合并解释成A0的8个位置。
+
+### 讨论问题：为什么按A0、A1、A16、A17读，为什么一次只有4个位置
+
+首先纠正维度：一个RB不是“12根天线的12个数据”。本工程这一段的三个维度是：
+
+```text
+输入层数：12条Layer
+RB频率位置：12个位置
+输出天线数：32根天线
+```
+
+所以Direct前后的完整矩阵分别是：
+
+```text
+Direct输入：12 Layer × 12位置
+Direct输出：32天线 × 12位置
+```
+
+数据总线一次只能并行装4个复数，因此完整RB被拆成三个子矩阵：
+
+```text
+子矩阵0：32天线 × 位置0～3
+子矩阵1：32天线 × 位置4～7
+子矩阵2：32天线 × 位置8～11
+```
+
+`Submatrix_Splitter`一次只接收和重排其中一个 `32天线×4位置` 子矩阵；三次才覆盖完整RB的12个位置。因此一行是4个复数而不是12个复数，本质原因是当前接口宽度只有：
+
+```text
+4个复数 × 每个32 bit = 128 bit
+```
+
+如果一拍传一根天线的12个位置，总线需要 `12×32=384 bit`，当前接口没有这么宽。
+
+再解释 `A0,A1,A16,A17`：模块后面有两套独立Pack模块和两路输出FIFO：
+
+```text
+Pack0负责A0～A15
+Pack1负责A16～A31
+```
+
+这里的 `Pack0`、`Pack1` 是讲解时的简称，RTL中的完整实例名分别是：
+
+```text
+MIMO_TX_Pack_Data0
+MIMO_TX_Pack_Data1
+```
+
+它们例化在 `TX_MIMO_Processor.v` 的 `Submatrix_Splitter_0` 后面。两套实例共用 `splitter_data[127:0]`，但valid不同：
+
+```verilog
+MIMO_TX_Pack_Data0(
+    .input_valid(splitter0_valid),
+    .subcarrier(splitter_data),
+    .output_valid(write_fifo_0),
+    .packed_data(fifo_data_0)
+);
+
+MIMO_TX_Pack_Data1(
+    .input_valid(splitter1_valid),
+    .subcarrier(splitter_data),
+    .output_valid(write_fifo_1),
+    .packed_data(fifo_data_1)
+);
+```
+
+因此不是Pack模块自己识别天线号，而是Splitter已经用两个valid完成选择：
+
+```text
+splitter_data=A0/A1/A2...A15时，只有splitter0_valid=1 → Pack_Data0接收
+splitter_data=A16/A17...A31时，只有splitter1_valid=1 → Pack_Data1接收
+```
+
+每套Pack模块一次取得连续两根天线：
+
+```text
+2根天线 × 每根128 bit = 256 bit
+```
+
+然后把256 bit串行输出为4个64-bit字，需要一个4拍输出窗口。Splitter采用2+2交替，使两套Pack轮流获得输入：
+
+```text
+拍0～1：A0、A1     → Pack0收一组256 bit
+拍2～3：A16、A17   → Pack1收一组256 bit
+拍4～5：A2、A3     → Pack0收下一组
+拍6～7：A18、A19   → Pack1收下一组
+```
+
+这样同一套Pack收到相邻两组的起点间隔4拍，正好与其4个U64的输出节拍相配；同时两套Pack交替工作。如果按 `A0,A1,A2,A3...` 连续读，前16拍都只服务Pack0、后16拍才服务Pack1，不能形成当前设计希望的双路交替流水，而且Pack0每两拍就收到新的一对天线，快于它4拍串行输出一组256-bit数据的节拍。
+
+## 5. MIMO_TX_Pack_Data
+
+### 一句话功能
+
+它连续接收两根天线的两个128-bit字，先合成一个256-bit数据包，再按从低位到高位的顺序拆成4个64-bit字输出。
+
+### 输入是什么
+
+```text
+input_valid         当前128-bit天线行有效
+subcarrier[127:0]   一根天线在当前4个连续位置上的4个复数
+```
+
+Splitter给每套Pack的有效输入都是连续两拍。例如Pack0第一次收到：
+
+```text
+第1拍：A0 = {A0位置3, A0位置2, A0位置1, A0位置0}
+第2拍：A1 = {A1位置3, A1位置2, A1位置1, A1位置0}
+```
+
+每个位置是一个32-bit复数，所以一个128-bit天线行含4个复数。
+
+### 中间实际只做哪几步
+
+#### 第一步：保存第一个128-bit天线行
+
+`delay_en`只在 `input_valid=1`时保存输入。第一拍A0被保存到 `subcarrier_delay1`。
+
+#### 第二步：第二个有效拍到来时把两根天线拼成256 bit
+
+`Toggle`在每个有效拍翻转一次，使 `Pack_Subcarrier`只在每两个有效输入中的第二拍启动：
+
+```text
+第1个有效拍A0：只保存
+第2个有效拍A1：把“前一拍A0 + 当前拍A1”一起打包
+```
+
+拼接代码为：
+
+```verilog
+packed_subcarriers <= {subcarrier_stream1, subcarrier_stream0};
+```
+
+因此得到：
+
+```text
+pack_out[127:0]   = A0
+pack_out[255:128] = A1
+```
+
+#### 第三步：把256 bit拆成4个64-bit字
+
+`PULSE_TO_STROBE_U16`产生4拍输出窗口，`pack_index=0～3`依次选择：
+
+```text
+第0个U64：pack_out[63:0]
+第1个U64：pack_out[127:64]
+第2个U64：pack_out[191:128]
+第3个U64：pack_out[255:192]
+```
+
+代入A0、A1后就是：
+
+```text
+U64_0：A0的位置0、位置1
+U64_1：A0的位置2、位置3
+U64_2：A1的位置0、位置1
+U64_3：A1的位置2、位置3
+```
+
+### 小数据例子
+
+假设当前四个位置为k、k+1、k+2、k+3，输入为：
+
+```text
+128-bit输入1：A0[k], A0[k+1], A0[k+2], A0[k+3]
+128-bit输入2：A1[k], A1[k+1], A1[k+2], A1[k+3]
+```
+
+输出为：
+
+```text
+64-bit输出0：A0[k],   A0[k+1]
+64-bit输出1：A0[k+2], A0[k+3]
+64-bit输出2：A1[k],   A1[k+1]
+64-bit输出3：A1[k+2], A1[k+3]
+```
+
+数据总量没有改变：
+
+```text
+输入：2 × 128 bit = 256 bit
+输出：4 × 64 bit  = 256 bit
+```
+
+### 子模块关系图
+
+```mermaid
+flowchart LR
+    A["第1拍：A0<br/>128 bit"] --> H["delay_en保存"]
+    B["第2拍：A1<br/>128 bit"] --> P["Pack_Subcarrier"]
+    H --> P
+    P --> W["256-bit<br/>{A1,A0}"]
+    W --> S["按64 bit拆成4拍"]
+    S --> O["packed_data[63:0]"]
+```
+
+### 输出是什么
+
+```text
+output_valid       连续4拍，表示4个64-bit字有效
+packed_data[63:0]  当前输出的两个复数
+```
+
+顶层有两套同构实例：
+
+```text
+MIMO_TX_Pack_Data0：处理A0～A15，输出fifo_data_0
+MIMO_TX_Pack_Data1：处理A16～A31，输出fifo_data_1
+```
+
+### 整体实现了什么功能
+
+```text
+两拍输入：两根天线 × 每根4个复数 × 32 bit
+→ 四拍输出：每拍2个复数 × 32 bit
+```
+
+它只是完成 `128-bit输入接口 → 64-bit FIFO接口` 的位宽转换和串行化，不做调制、预编码、缩放，也不改变天线和位置的先后顺序。
+
+### 先记住的关键代码
+
+两根天线拼接：
+
+```verilog
+.subcarrier_stream0(subcarrier_delay1), // 前一根天线
+.subcarrier_stream1(subcarrier),        // 当前根天线
+
+packed_subcarriers <= {subcarrier_stream1,subcarrier_stream0};
+```
+
+低64位开始依次输出：
+
+```verilog
+case(pack_index_delay1)
+    0: packed_data <= pack_out_latch[63:0];
+    1: packed_data <= pack_out_latch[127:64];
+    2: packed_data <= pack_out_latch[191:128];
+    3: packed_data <= pack_out_latch[255:192];
+endcase
+```
+
+### 讨论问题：为什么要例化两个Pack模块
+
+主要原因是增加并行吞吐量，并且匹配后级两路64-bit FIFO。Splitter读出速度是一拍一个128-bit天线行：
+
+```text
+前级输入带宽：128 bit/拍
+单个Pack输出带宽：64 bit/拍
+两个Pack合计带宽：2×64 = 128 bit/拍
+```
+
+如果只有一个Pack和一条64-bit输出，对一个四位置子矩阵：
+
+```text
+输入：32根天线 × 128 bit，需要32拍进入
+输出：32根天线 × 2个U64，需要64拍输出
+```
+
+输出速度只有输入的一半，需要额外缓存，或者把相邻子矩阵的启动间隔加长。当前设计把天线分成两半并交错调度：
+
+```text
+Pack0：A0～A15  → fifo_data_0
+Pack1：A16～A31 → fifo_data_1
+```
+
+每套Pack每4拍收到一对天线，并用4拍输出对应的4个U64；两套Pack错开工作。因此，两个Pack既提高吞吐量，也直接形成后级需要的前16/后16天线两路数据流。它们不会让单个数据的组合逻辑延迟减半，提升的是持续流处理能力和并行输出带宽。
