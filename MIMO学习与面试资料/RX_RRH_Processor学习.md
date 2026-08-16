@@ -28,18 +28,95 @@ strobe_upstream/trigger_upstream  板间同步链输入
 
 ```mermaid
 flowchart LR
-    A4["天线4时域采样"] --> SY["Sync_Top<br/>PSS检测→粗定时<br/>精频偏估计→四板握手"]
-    SY -->|"First_sample_index<br/>precise_cfo<br/>align trigger"| C0["RX_RRH_Chain0<br/>天线0/1"]
-    SY --> C1["RX_RRH_Chain1<br/>天线2/3"]
-    SY --> C2["RX_RRH_Chain2<br/>天线4/5"]
-    SY --> C3["RX_RRH_Chain3<br/>天线6/7"]
-    C2 -->|"天线4 FFT结果"| FT["timing_count + Frequency Tracking<br/>比较子帧0的符号0和7"]
-    FT -->|"tracking estimate"| C0 & C1 & C2 & C3
-    C0 --> O1["FIFO_data1<br/>天线0/1"]
-    C1 --> O2["FIFO_data2<br/>天线2/3"]
-    C2 --> O3["FIFO_data3<br/>天线4/5"]
-    C3 --> O4["FIFO_data4<br/>天线6/7"]
+    IN["8根天线时域IQ<br/>rx0～rx7<br/>每路I/Q各16 bit，C1.15"]
+
+    subgraph SYNC["同步控制支路：Sync_Top只使用天线4"]
+        direction LR
+        A4["天线4时域IQ"] --> CT["Coarse_Timing_Estimation<br/>PSS相关与峰值搜索<br/>得到First_sample_index"]
+        A4 --> RC["RAM_control<br/>环形缓存参考采样"]
+        CT -->|"PSS触发"| RC
+        RC --> PCFO["Precise_Carrier_Frequency_offset_Estimation<br/>CP与对应正文共轭相关<br/>得到precise_cfo"]
+        PCFO --> HS["SYNC_Handshake<br/>四片FPGA准备状态汇总<br/>产生align_working_trigger"]
+    end
+
+    subgraph CHAINS["主数据通路：4×RX_RRH_Chain并行处理0/1、2/3、4/5、6/7"]
+        direction LR
+        AL["每条Chain：2×Align_output_with_CFO_compensation<br/>共8块20480深度环形RAM<br/>统一帧起点＋频偏反向旋转<br/>输出仍为带CP时域IQ"]
+        CP["每条Chain：2×CP_Removal<br/>符号0/7屏蔽320点<br/>其余符号屏蔽288点<br/>每根天线留下4096点时域正文"]
+        FFT["每条Chain：2×FFT_All_Remain<br/>4096点FFT<br/>时域 → 频域<br/>每根天线输出4096个29-bit复数"]
+        DC["每条Chain：2×DC_Position_Change<br/>去中心DC、后半段前移、末尾补0<br/>4×over_under：29 bit → 16 bit"]
+        PACK["每条Chain：RX_Pack_Data<br/>两天线×4位置局部转置<br/>(A0,B0)…(A3,B3)<br/>→ A0A1、A2A3、B0B1、B2B3"]
+        AL -->|"带CP时域IQ<br/>4416/4384点"| CP
+        CP -->|"去CP时域IQ<br/>每符号4096点"| FFT
+        FFT -->|"频域子载波<br/>每拍每根天线1个复数"| DC
+        DC -->|"C9.7复数<br/>每个32 bit"| PACK
+    end
+
+    subgraph TRACK["残余频偏跟踪支路：复用天线4的FFT结果"]
+        direction LR
+        CUT["saturated_overflow<br/>天线4 FFT数据29 bit → 25 bit"] --> FTC["Frequency_Tracking_Control<br/>选择符号0/7参考数据<br/>控制写入、读出和去DC"]
+        TC["timing_count<br/>根据FFT valid上升沿<br/>产生subframe/symbol计数"] --> FTC
+        FTC --> FTT["Frequency_Tracking_Top<br/>比较参考符号相位变化<br/>输出frequency_track_result"]
+    end
+
+    OUT["RX_RRH_Processor输出<br/>4路并行64-bit<br/>FIFO_data1：天线0/1<br/>FIFO_data2：天线2/3<br/>FIFO_data3：天线4/5<br/>FIFO_data4：天线6/7"]
+    EX["模块外：RX_RRH_FIFO_Exchange<br/>4路并行 → 1路64-bit<br/>每小块16个U64<br/>3小块=12子载波=1RB<br/>形成RB优先顺序"]
+    FM["FIFO_Manager / 板间交换<br/>同一RB的4块FPGA数据<br/>汇到负责该RB的MIMO FPGA"]
+    MIMO["RX_MIMO_Processor<br/>汇齐32天线<br/>进行MIMO检测"]
+
+    IN --> AL
+    IN -.->|"抽取天线4"| A4
+    CT -.->|"First_sample_index"| AL
+    PCFO -.->|"precise_cfo"| AL
+    HS -.->|"align_working_trigger"| AL
+    FFT -.->|"Chain2的天线4原始FFT数据"| CUT
+    FFT -.->|"data_frequency_valid上升沿"| TC
+    FTT -.->|"frequency_track_result<br/>use_tracking控制是否采用"| AL
+    PACK --> OUT --> EX --> FM --> MIMO
 ```
+
+读图时把它分成三条线：粗实线是8天线主数据；上方同步支路只用天线4产生统一起点、初始频偏和四板启动触发；下方跟踪支路再从天线4的FFT结果估计残余频偏，并反馈给全部8根天线的`Align_output_with_CFO_compensation`。`RX_RRH_Processor`本身输出4条天线对流，完整RB优先顺序要到紧接着的`RX_RRH_FIFO_Exchange`才形成。
+
+### 图中`First_sample_index`、`precise_cfo`和`align_working_trigger`的关系
+
+这三根线组成同一帧的“两个参数＋一个启动脉冲”，但不是同一拍计算出来：
+
+| 信号 | 类型 | 产生时间 | 后级用途 |
+|---|---|---|---|
+| `First_sample_index` | 15-bit参数 | PSS峰值被确认时锁存 | 指明本帧第一个读取采样在20480深度环形RAM中的地址 |
+| `precise_cfo` | 32-bit参数 | PSS触发精频偏取数和相关计算完成后锁存 | 作为DDS频偏补偿的初始归一化频率字 |
+| `align_working_trigger` | 单拍控制脉冲 | 本板精频偏完成且四片FPGA握手完成后产生 | 通知四条`RX_RRH_Chain`同时锁存前两个参数并开始本帧读取 |
+
+```text
+t0：检测到PSS
+    └─ First_sample_index锁存并保持
+
+t1～t2：RAM_control取参考样本、精频偏模块计算
+    └─ precise_cfo锁存并保持，precise_cfo_valid启动四板握手
+
+t3：四板均准备好
+    └─ align_working_trigger产生1拍
+       ├─ First_sample_index_reg <= First_sample_index
+       └─ 初始CFO寄存器 <= precise_cfo
+```
+
+所以答案分两层：它们的产生拍不对齐；但在`align_working_trigger=1`的有效时钟沿，`First_sample_index`和`precise_cfo`都已经稳定，并被`Align_output_with_CFO_compensation`作为同一帧参数同时采样。`First_sample_index`来自该次PSS峰值，精频偏取数也由同一次PSS触发，因此逻辑上对应同一帧。四片板共用统一启动时刻，但每片板使用自己检测和计算出的本地地址、频偏参数。
+
+### 残余频偏反馈是不是一个循环
+
+是一个有寄存器和整符号处理延迟的数字反馈环，不是组合逻辑闭环：
+
+```text
+precise_cfo补偿
+→ 天线4的4096点FFT结果
+→ 选取第0子帧的符号0/7参考数据
+→ Frequency_Tracking计算残余频偏
+→ frequency_track_result锁存
+→ 与precise_cfo相加
+→ 修正后续输出采样的频偏补偿
+```
+
+新无线帧开始时，`Compensation_CFO_Calculation`先只锁存和使用`precise_cfo`，并清除“使用跟踪值”标志；第0子帧完成后才允许把已锁存的`frequency_track_result`加到初始频偏上。因此环路使用前面已经处理的参考符号修正后续子帧，不能回头修改已经通过FFT输出的数据。FFT、跟踪计算、valid和结果锁存均引入时序间隔，所以不存在同一拍内输出立即反馈到自身输入的组合环路。
 
 主数据路径为：
 
@@ -68,7 +145,7 @@ strobe_for_downstream           板间同步级联状态
 all_ready_trigger               四片板全部准备好后的统一对齐触发
 ```
 
-每个64-bit输出每拍包含两个32-bit复数，但`RX_Pack_Data`会把“同一位置两个天线并行”的FFT输出改回发射端MIMO/RRH接口习惯的天线优先小块顺序。
+每个64-bit输出每拍包含两个32-bit复数。`RX_Pack_Data`先在一个四子载波小块内部完成“两根天线×四个位置”的局部转置；随后`RX_RRH_FIFO_Exchange`把8根天线的三个四子载波小块合成一个完整RB，因此系统全局输出是RB优先，而不是纯天线优先。
 
 ## 输入时域采样从哪里来
 
@@ -267,7 +344,7 @@ RX_no_receiving         1       →  0  ─────────────�
 含义                  搜索PSS     已找到       可再次搜索PSS       接收窗口结束
 ```
 
-按照源码注释的设计尺度，`245760 = 61440×4`表示一个子帧对应的时钟数，`2457600=10×245760`表示十个子帧。若本模块 `clk`确为245.76 MHz，则它们名义上分别对应1 ms和10 ms；但实际工程时钟必须再沿顶层约束核实，不能只凭常数换算。
+`MIMO_RX_Top`把`clk_baseband`接入本模块，工程`Clk_Div4.xci`配置确认其输入为245.76 MHz、四分频输出为61.44 MHz。因此`245760 = 61440×4`表示一个1 ms子帧对应245760个处理时钟，`2457600=10×245760`表示一个10 ms无线帧；部分子模块端口名仍写`clk_192M`，属于旧命名，不能据此把当前处理时钟解释为192 MHz。
 
 #### 关键代码风险和待验证项
 
@@ -362,6 +439,79 @@ add_index=2n+1 ：addr = basic_index + n + 4247
 
 ### Precise_Carrier_Frequency_offset_Estimation
 
+#### 一句话作用
+
+模块把上一模块输出的240拍交错IQ配成120对，对每对执行“前段样本×后段样本的共轭”，把120个复数结果累加后求相位，再换算成后级频移模块可直接使用的32-bit有符号归一化频偏/补偿步进。
+
+#### 输入、输出与主数据流
+
+| 端口 | 含义 |
+|---|---|
+| `valid_in` | 输入数据有效；当前RTL实际连续240拍 |
+| `data_in_real/imag[15:0]` | C1.15复数输入，顺序为`early0,late0,...,early119,late119` |
+| `precise_CFO_finish` | 最终结果有效的单拍脉冲 |
+| `precise_Carrier_Frequency_offset[31:0]` | 有符号归一化频偏；由于复乘顺序，它更准确地说是后级使用的频偏补偿方向 |
+
+```text
+240拍交错IQ
+early0,late0,early1,late1,...
+        │
+        ├─1拍错位+奇偶计数
+        ▼
+120对：early[n] 与 conj(late[n])
+        │
+        ├─复数乘法，6拍流水
+        ▼
+120个复数相位差结果
+        │
+        ├─实部、虚部分别累加，4拍流水
+        ▼
+Z = Σ early[n]·conj(late[n])
+        │
+        ├─饱和裁剪、CORDIC atan2
+        ▼
+phase/π
+        │
+        └─按2×4096=8192换算、四舍五入、符号扩展
+        ▼
+precise_Carrier_Frequency_offset + finish
+```
+
+#### 240拍如何配成120对
+
+`start_work`跟随`valid_in`，1-bit `counter`只在工作期间翻转。输入先被寄存，`data_in_fin`再把普通输入延迟1拍；另一支把当前输入的虚部取反形成共轭。只在`counter=1`的每隔一拍向复数乘法器送一次有效：
+
+```text
+输入拍：       early0 late0 early1 late1 early2 late2 ...
+延迟普通支路：   -    early0 late0 early1 late1 early2 ...
+当前共轭支路： conj(e0) conj(l0) conj(e1) conj(l1) ...
+乘法有效：          ↑          ↑          ↑
+实际运算：     early0·conj(late0)
+                              early1·conj(late1)
+                                          early2·conj(late2)
+```
+
+所以240拍输入、每2拍一次复乘，实际完成120次复乘。源文件中“120个数据只进行60次乘法”的注释是旧参数残留。
+
+虚部取反时对`16'h8000`单独处理：C1.15的最小负数`-1.0`直接二补码取负仍会溢回自身，因此代码将其饱和为`16'h7fff`，避免共轭操作产生符号错误。
+
+#### 为什么共轭相乘能得到频偏
+
+设后段相对前段跨过`N=4096`个采样，物理频偏为`Δf`、采样率为`Fs`：
+
+```text
+late[n] ≈ early[n] · exp(j·2π·Δf·N/Fs)
+```
+
+代码计算的顺序是：
+
+```text
+early[n] · conj(late[n])
+≈ |early[n]|² · exp(-j·2π·Δf·N/Fs)
+```
+
+幅度和原始调制数据被消去，留下公共相位差。因为这里是`early×conj(late)`，正物理频偏得到负相位，所以模块输出天然带有补偿方向；若把乘法顺序交换，符号会相反。
+
 模块把上述交错流两两配对，对每一对执行复数共轭相乘，并累计120对：
 
 ```text
@@ -370,13 +520,223 @@ phase = atan2(Im{Z}, Re{Z})
 precise_cfo = 按4096点间隔换算后的归一化频偏
 ```
 
-累加120对而不是只用一对，是为了让噪声大致相互抵消。`use_sync_fre=0`不会关闭PSS时间同步，只是在估计完成后把锁存的 `precise_cfo`强制写为0。
+累加120对而不是只用一对，是为了让同方向的公共相位相干叠加、随机噪声部分互相抵消。复数乘法器输出实虚部各33 bit，实部和虚部分别进入40-bit累加器；乘法器无有效输出时给累加器送0，因为该累加器没有单独输入有效口。
+
+#### 相位为什么除以8192
+
+CORDIC配置为`Scaled Radians`，输出不是普通弧度，而是：
+
+```text
+CORDIC输出p = phase/π
+```
+
+由前面的公式：
+
+```text
+p = -2·Δf·4096/Fs
+```
+
+因此：
+
+```text
+p / (2×4096) = p/8192 = -Δf/Fs
+```
+
+这就是后级NCO/频移模块需要的“每个采样应补偿多少周”的归一化相位步进。代码没有实例化除法器，而是利用定点格式变换完成2的幂除法：CORDIC有效输出视为3.26格式，最终要解释为32-bit小数；`round_half_up`丢弃7个原始低位并四舍五入，结合小数点从26位移动到32位，等效净除以`2^(7+6)=2^13=8192`。
+
+#### 控制与位宽主线
+
+1. `valid_in`上升沿启动一次计算，并在复数乘法器数据到达前清零两只累加器。
+2. 复数乘法器IP延迟6拍，只有其`mul_out_valid=1`时才把33-bit实虚部结果送入累加器，否则送0。
+3. 两只累加器IP延迟4拍，输出40-bit实部和虚部累加值。
+4. `saturated_overflow`把累加结果饱和到39 bit，再各补1个符号位，组成CORDIC需要的两个40-bit有符号输入，避免简单截高位造成符号翻转。
+5. `valid_in`下降沿经过补偿延迟后启动一次`atan2`；CORDIC输出有效再延迟2拍，对齐四舍五入和最终输出寄存器，形成`precise_CFO_finish`。
+
+`use_sync_fre`不在本模块内，而在`Sync_Top`输出锁存处使用：`use_sync_fre=0`不会关闭PSS时间同步或本模块运算，只是在结果完成时把锁存的`precise_cfo`强制写为0。
 
 代码实际输入精频偏模块的是240拍并完成120次复乘；部分注释仍写“valid持续120拍”或旧的2048点间隔，属于旧参数残留，应以 `Read_RAM_for_PCFO.N=240` 和两地址相差4096的RTL为准。
 
+#### 第一遍需要记住的风险点
+
+1. 输出符号取决于复乘顺序。当前是`early×conj(late)`，得到的是物理频偏的负方向，更像补偿步进；不能脱离后级`carrier_frequency_shift`约定单独解释正负。
+2. 当前地址间隔和缩放都按4096点FFT配置，但源文件头仍有2048点、30.72 MHz等旧注释；修改FFT长度时必须同时修改取数地址差和`8192`缩放关系。
+3. 模块依赖`valid_in`是单段连续且长度为偶数；若中间出现空洞或只输入奇数个样本，一拍配对关系会被破坏。
+
+#### 讨论：它是否利用CP精确确定帧开始和结束
+
+不是。当前工程把“时间位置”和“频率偏差”分成两条并行支路：
+
+```text
+PSS相关峰
+├─时间支路：峰位置×32－固定帧结构偏移－FFT提前量
+│            → First_sample_index
+│            → Align_output从该地址开始读RAM
+│            → symbol_start_generator按4096+320/288计数符号和帧边界
+│
+└─频率支路：PSS_trigger锁存RAM基准
+             → 读取CP与4096点后的符号尾部
+             → Precise_CFO只计算相位旋转/频偏补偿值
+```
+
+PSS本身不在无线帧第一个采样点，代码利用PSS在帧中的已知位置和固定延迟常数，把相关峰换算成`First_sample_index`。源码注释明确说明当前项目删除了单独的精定时同步，因此所谓`Precise_Carrier_Frequency_offset_Estimation`中的`Precise`指精频偏，不是精确定时。
+
+CP取数也不是依赖“已知参考符号内容”。任意正常OFDM符号的CP都是该符号尾部的复制，本模块只利用这一重复关系估计相位差；它没有输出新的采样地址、符号起点或帧终点。帧结束也不是再次从接收波形中检测出来，而是`symbol_start_generator`从统一启动触发开始，按长符号`4096+320=4416`、普通符号`4096+288=4384`以及一帧140个符号的结构计数得到。
+
+#### 讨论：为什么共轭相乘、累加后再求反切
+
+接收机无法直接观察一个独立的“频偏相位”。单个接收样本可写成：
+
+```text
+r[n] = A[n]·exp(j(φdata[n]+φchannel[n]+φ0+ωn)) + noise
+```
+
+直接对`r[n]`求角度，会同时得到调制数据相位、信道相位、初始相位和频偏累积相位，无法知道其中哪一部分来自频偏。CP样本与4096点后的符号尾部样本源自同一个发送数据，在信道在这一小段时间内基本不变且CP长于信道冲激响应的条件下，两者的数据相位和信道相位近似相同：
+
+```text
+early[n] = A[n]·H[n]·exp(jφ0)
+late[n]  = A[n]·H[n]·exp(j(φ0+Δφ))
+```
+
+当前代码计算：
+
+```text
+early[n]·conj(late[n])
+= |A[n]·H[n]|²·exp(-jΔφ)
+```
+
+于是未知的数据相位、信道公共相位和初始相位全部抵消，只留下幅度权重和频偏相位的负数。负号不是算法必须，而是复乘顺序造成的：`late×conj(early)`会得到`+Δφ`；当前顺序直接产生接收补偿所需的反向旋转，后级无需再额外取负。
+
+分别计算`angle(early)`和`angle(late)`再相减，在数学上与共轭乘积求角等价，但硬件上需要两次反正切，还必须处理`+π/-π`跨界。先做一次复乘把相位差变成一个复向量，只需最后调用一次CORDIC，资源更少且不存在单独两角相减的环绕问题。
+
+每一对复乘都含噪声，若对120个角度分别求反切再做普通算术平均，会受到相位环绕影响。当前做法先把120个复向量相干累加：
+
+```text
+Z = Σ early[n]·conj(late[n])
+Δφ_est = atan2(Im{Z},Re{Z})
+```
+
+公共频偏相位同方向叠加，随机噪声部分互相抵消；幅度较大的可靠样本还会自然获得更高权重。最后一次`atan2`取出累加向量的公共相位，稳定性明显高于只用一对数据。
+
+频偏属于广义同步中的“载波频率同步”，但不等于帧/符号的“时间同步”。主要来源是收发本振频率不一致、晶振误差和漂移，以及移动场景中的多普勒；静态多径信道通常造成幅相和频率选择性失真，本身不会产生统一的载波频移。频偏在时域表现为`exp(jωn)`的持续相位旋转，在OFDM频域会造成公共相位误差和子载波间干扰，所以即使`First_sample_index`完全正确，频偏不补偿仍可能无法正确解调。
+
 ### SYNC_Handshake
 
-每片FPGA完成本地PSS检测和精频偏估计后，把单拍完成信号拉长为 `WAIT_CYCLE` 拍。多片板的ready窗口沿LVDS级联相与；只有这些窗口发生重叠，才说明四片FPGA都在允许误差范围内完成了同步。最终FPGA0检测汇总ready的上升沿，并把统一触发返回其他板：FPGA0从汇总strobe启动，其余板从返回trigger启动，从而让四片板的八路本地接收链在统一时刻读取各自环形RAM。
+#### 一句话作用
+
+它不处理IQ，也不执行PSS或频偏算法；它把四片FPGA各自的“精频偏估计完成”汇总起来，确认四片都在允许时间差内准备好后，由FPGA0发出统一启动通知，使四片板的接收链从各自的`First_sample_index`同时开始对齐读RAM。
+
+#### 输入与输出
+
+| 端口 | 含义 |
+|---|---|
+| `PSS_deteced_trigger_self` | 名字仍叫PSS，但`Sync_Top`实际接入的是本板`precise_cfo_valid`，表示本板定时地址和精频偏结果已经准备好 |
+| `WAIT_CYCLE[11:0]` | 把本地单拍完成脉冲拉长的周期数，也是允许四板完成时刻存在的容差窗口 |
+| `strobe_upstream` | 前级板传来的“截至前级所有板都准备好”窗口 |
+| `trigger_upstream` | FPGA0产生并逐级返回的统一启动通知 |
+| `strobe_for_downstream` | 本板本地ready与前级累计ready相与后的结果，继续送往下一板 |
+| `align_working_trigger` | 本板接收链真正开始RAM对齐读取和频偏补偿的单拍触发 |
+| `all_ready_trigger` | FPGA0输出4拍启动通知；其他板把收到的通知继续传给下一板 |
+
+#### 为什么要握手
+
+四片FPGA分别处理各自的8根接收天线，各片完成PSS检测和精频偏估计的时刻可能相差若干拍。如果每片完成后立即启动，则各板输出的同一拍可能属于不同的OFDM采样或符号，后续32天线MIMO检测无法把它们组成同一个接收向量。因此必须等待四片全部准备好，再统一启动。
+
+每片把本地完成单拍拉长为`WAIT_CYCLE`拍：
+
+```text
+FPGA1 local_ready：   ─────████████████─────
+FPGA2 local_ready：      ─────████████████─────
+FPGA3 local_ready：        ─────████████████─────
+FPGA0 local_ready：          ─────████████████─────
+四者相与：                   ──███──────────────
+                                 ↑
+                          出现重叠说明四板都已准备好
+```
+
+若最晚完成与最早完成之差小于`WAIT_CYCLE`，四个窗口就会重叠；若相差超过该窗口，本轮不会产生统一启动。`WAIT_CYCLE`也不能无限增大，因为最早完成的板仍在环形RAM中保存所需帧数据，等待过久可能导致数据被覆盖；源码注释给出的上限依据是RAM回绕余量`20480-17280=3200`拍。
+
+这里必须区分两类环形RAM。前面`RAM_control`中的8512深度小RAM只服务于参考天线的精频偏取数，PSS触发后会用`disable_store_data`短暂停止写入，读完240拍后恢复；它不是`WAIT_CYCLE`限制所指的缓存。每根天线的`Align_output_with_CFO_compensation`内部还有一块20480深度主环形RAM，用于保存等待对齐和后续频偏补偿所需的连续时域IQ。该RAM的写使能直接连接`input_valid`，写地址只要`input_valid=1`就持续递增并回绕，不受握手状态控制：
+
+```text
+8512小同步RAM：PSS触发后短暂停写，只为读取120对精频偏样本
+20480主对齐RAM：等待四板握手时仍持续写入，保存每根天线的连续时域IQ
+```
+
+主RAM不能在等待时简单停写，因为ADC/上游仍在产生新的空口采样；停写只会丢失等待期间的数据，使RAM地址不再对应连续时间。握手必须在写指针绕回并覆盖`First_sample_index`所指帧起点之前完成，因此`WAIT_CYCLE`受剩余缓存距离约束。
+
+#### 第一趟：逐级汇总四片ready
+
+`PULSE_TO_STROBE_U16`先把本板`precise_cfo_valid`拉长：
+
+```text
+本地单拍完成 → PSS_deteced_strobe_self，持续WAIT_CYCLE拍
+```
+
+按代码中的FPGA编号，ready汇总链从FPGA1开始：
+
+```text
+FPGA1：strobe_for_downstream = ready1
+FPGA2：strobe_for_downstream = ready1 & ready2
+FPGA3：strobe_for_downstream = ready1 & ready2 & ready3
+FPGA0：内部再与ready0
+       = ready0 & ready1 & ready2 & ready3
+```
+
+FPGA0对最终相与结果做上升沿检测。这个上升沿既成为FPGA0自己的`align_working_trigger`，也说明四板ready窗口已经重叠。
+
+#### 第二趟：FPGA0把统一启动通知传回其他板
+
+FPGA0把最终上升沿拉长4拍形成`all_ready_trigger`，便于板间信号可靠捕获。其余FPGA收到`trigger_upstream`后先经过寄存器同步并提取上升沿：
+
+```text
+FPGA0：最终ready上升沿 → 自己启动 + 发出4拍通知
+                                 ↓
+其他FPGA：trigger_upstream → 两级寄存/上升沿检测
+                                 ↓
+                         align_working_trigger
+```
+
+非0号板还把收到的多拍通知从`all_ready_trigger`继续透传给下一板，形成统一启动通知的级联传播。
+
+#### align_working_trigger最终启动什么
+
+在`RX_RRH_Processor`中，该信号同时送到四个`RX_RRH_Chain`，端口虽然仍命名为`precise_cfo_valid`，实际语义已经是“四板统一允许开工”。每条链在该触发下锁存本板的`First_sample_index`和`precise_cfo`，然后从各自环形RAM对应帧起点开始读数，依次进行频偏补偿、去CP和FFT。
+
+#### 代码风险与命名问题
+
+1. `PSS_deteced_trigger_self`名称容易误解，`Sync_Top`实际连接的是`precise_cfo_valid`，所以它表示精频偏结果已准备好，不是原始PSS峰触发。
+2. `all_ready_trigger`在FPGA0上是4拍窗口而非严格单拍；真正给本地处理链的是经过上升沿提取后的`align_working_trigger`。
+3. 多个跨板输入只用寄存器同步和脉冲拉长，没有完整请求/应答协议；设计依赖`WAIT_CYCLE`和4拍通知保证不会漏采。
+4. 部分内部寄存器没有显式复位，RTL仿真初期可能出现X；正常工作依赖输入窗口最终回到0后建立确定状态。
+
+#### 讨论：align_working_trigger与First_sample_index能否保证同一拍
+
+需要区分“同一物理时钟沿”和“同一无线帧采样序号”。在单片FPGA内部，四个`RX_RRH_Chain`共用同一个`align_working_trigger`和同一个`First_sample_index`，并且各天线环形RAM使用同样的写地址节拍，因此设计意图是让本板8根天线从同一个逻辑帧采样开始读取。
+
+`Align_output_with_CFO_compensation`在`trigger`到来时先锁存：
+
+```text
+First_sample_index_reg <= First_sample_index
+```
+
+同时将`trigger`延迟1拍后才启动`symbol_start_generator`。随后本地第`k`个有效读样本使用：
+
+```text
+read_address = (First_sample_index_reg + k) mod 20480
+```
+
+所以单链内部的顺序是“先锁存帧起点，再从起点产生第0、1、2……个读地址”，不会在同一拍竞争旧索引。
+
+跨四片FPGA时，`First_sample_index_i`是各板在各自环形RAM地址空间中计算的本地地址，数值不一定必须相等；只要都指向空口中同一个无线帧采样，`First_sample_index_i+k`就表示同一个逻辑采样`k`。`align_working_trigger`只统一“现在允许开始”，不会比较或校正四片板的索引内容。板间触发还经过级联、同步寄存器和上升沿检测，因此不能仅凭这两个信号断言四片板在绝对相同的245.76 MHz时钟沿产生第一个输出；后级FIFO可以吸收固定到达时延，但不能修复某片板把帧起点算错若干采样的问题。
+
+因此结论是：
+
+```text
+同一本地触发事件与本地First_sample_index配对：可以保证
+四板输出代表同一逻辑帧采样序号：设计目标，依赖各板PSS定时正确和采样时钟一致
+四板在绝对同一个物理时钟沿输出：代码本身不保证
+某板First_sample_index计算错误后自动纠正：不能，握手只检查ready而不比较索引
+```
 
 ### ready_for_input说明
 
@@ -455,6 +815,36 @@ Chain3：天线6/7
 
 顶层同步和频偏参数由天线4估计后共享给全部8根天线。只有Chain2的`data_out_valid`连接到顶层，设计假定四条链严格同拍。
 
+### RX_RRH_Chain顶层直读
+
+一句话：每个`RX_RRH_Chain`接收两根天线的连续16-bit时域IQ，共享同一帧起点和频偏参数，经过对齐、频偏补偿、去CP、4096点FFT、DC位置调整和位宽裁剪后，把“2天线×4连续子载波”重排为4个64-bit字输出。
+
+主要输入分为三类：
+
+| 类别 | 信号 | 含义 |
+|---|---|---|
+| 两天线数据 | `data_in_real/imag0/1`、`data_in_valid` | 两根天线同步到达的C1.15连续时域IQ |
+| 初始同步参数 | `precise_cfo_valid`、`First_sample_index`、`precise_cfo` | 这里的`precise_cfo_valid`实际连接四板握手后的`align_working_trigger`，用于锁存帧起点和初始频偏并启动处理 |
+| 后续频率控制 | `frequency_tracking_estimate_valid`、`frequency_tracking_estimate`、`scale_factor` | 更新残余频偏补偿并调节FFT输出缩放 |
+
+主要输出：
+
+| 信号 | 含义 |
+|---|---|
+| `data_out[63:0]`、`data_out_valid` | 面向后级FIFO的两天线频域打包数据 |
+| `data_frequency_real0/imag0[28:0]`、`data_frequency_valid` | 天线0未经DC重排和16-bit裁剪的原始FFT流，Chain2中的天线4通过该口送频率跟踪模块 |
+
+两条天线通路从对齐到`over_under`完全并行，并共享第一条通路产生的`data_valid_align`、`symbol_start`、`data_without_cp_valid`和`data_frequency_valid`作为公共控制。第二条通路的valid端口多数悬空，设计建立在两个同构实例延迟严格一致的假设上；任何一条IP配置或流水延迟不同都会破坏两天线配对。
+
+两根天线直到`RX_Pack_Data`才合并。每拍进入两个32-bit复数`A(k)`和`B(k)`，先收集4个连续频率位置：
+
+```text
+输入4拍： [A(k0),B(k0)] [A(k1),B(k1)] [A(k2),B(k2)] [A(k3),B(k3)]
+输出4拍： [A(k0),A(k1)] [A(k2),A(k3)] [B(k0),B(k1)] [B(k2),B(k3)]
+```
+
+每个64-bit输出含两个32-bit复数采样。这只是四子载波小块内部的局部转置：把“两天线在同一位置并行”改成“每根天线连续两个位置”。后面的`RX_RRH_FIFO_Exchange`再把四条天线对流按小块轮流读出，并用三个小块组成一个RB，所以全局层级应称为RB优先。
+
 ### Chain内部大图
 
 ```mermaid
@@ -481,16 +871,226 @@ PSS检测得到First_sample_index
 
 两根天线使用两个独立实例，但共享相同起点和频偏，因此保持阵列通道对齐。
 
+### Align顶层输入输出
+
+| 端口 | 含义 |
+|---|---|
+| `IQ_sample_in_real/imag`、`input_valid` | 某一根天线连续到达的C1.15时域IQ |
+| `trigger` | 顶层实际接`align_working_trigger`；四板握手后锁存同步参数并启动帧处理 |
+| `First_sample_index` | 当前无线帧采样0在本地20480深度环形RAM中的地址 |
+| `precise_Carrier_Frequency_offset` | 由CP估计得到的初始有符号归一化频偏补偿步进 |
+| `frequency_tracking_estimate[_valid]` | 第0子帧后更新的残余频偏跟踪结果 |
+| `output_valid`、`data_out_real/imag` | 对齐并完成频偏补偿后的时域IQ符号流 |
+| `output_valid_rising` | 每个输出符号有效窗口的上升沿，作为后级`CP_Removal`的符号开始 |
+
+### 主数据流
+
+```text
+连续输入IQ
+   │ input_valid时写入
+   ▼
+20480深度Simple Dual Port环形RAM
+   │ trigger时锁存First_sample_index
+   │ symbol_start_generator产生4416/4384拍突发读窗口
+   ▼
+read_addr = (First_sample_index_reg + additional_index) mod 20480
+   │
+   ▼
+RAM读出IQ
+   │ valid延迟对齐
+   ▼
+carrier_frequency_shift
+   │ × exp(j·相位累积)，PINC=初始频偏+跟踪频偏
+   ▼
+C1.15对齐时域IQ + output_valid
+```
+
+### 主环形RAM：连续写、突发读
+
+RAM是32-bit×20480的简单双口RAM，端口A写、端口B读。写端在`input_valid=1`时把`{imag,real}`写入`write_ram_addr`，地址从0～20479循环；握手、读出和频偏补偿都不会暂停写入。
+
+这块RAM不是保存完整614400点无线帧，而是弹性/速率转换缓存。输入样本按上游有效节拍持续写入；读端从`First_sample_index`起，每个OFDM符号连续高速读出：
+
+```text
+长CP符号：连续读4416拍 = 320 CP + 4096正文
+普通符号：连续读4384拍 = 288 CP + 4096正文
+相邻读突发之间留有空闲时间
+```
+
+后面的`CP_Removal`把突发开头的CP屏蔽，Burst FFT因而能得到连续4096拍正文。主RAM同时承担了时间对齐和把稀疏/较慢输入转换成连续符号突发的作用。
+
+### 触发与读地址
+
+`trigger`到来这一拍先锁存`First_sample_index_reg`，触发延迟1拍后才启动`symbol_start_generator`，确保先保存帧起点再开始读。`additional_index`只在`symbol_valid_out=1`的读突发中递增并在20479回绕：
+
+```text
+本帧第k个输出样本地址
+= (First_sample_index_reg + k) mod 20480
+```
+
+代码先用16-bit `total_index`保留加法进位，再根据是否大于等于20480选择原值或减20480。源码中相关注释仍写30720，属于旧RAM深度残留，实际XCI和RTL常量都是20480。
+
+`additional_index`只在全局复位时清0，没有在新`trigger`到来时清0。正常完整输出一帧时，`614400=30×20480`，它恰好绕回0；若一帧中途异常重触发或提前终止，下一帧可能不再从偏移0开始，这是当前实现的设计假设和风险。
+
+### symbol_start_generator：什么时候读、读多久
+
+触发到来后，内部锁存`enable`并连续安排140个OFDM符号。`feedback_en_7_U16`每7个符号循环一次，因此每个slot中的符号0使用长CP，其余6个使用普通CP；一个子帧含两个slot，表现为符号0和7为长CP。
+
+它同时生成两组长度：
+
+```text
+符号启动间隔：长17660拍、普通17530拍（基带处理时钟域固定调度值）
+RAM连续读长度：长4416点、普通4384点（实际OFDM采样数）
+```
+
+这两个启动间隔在`symbol_start_generator.v`中直接硬编码为`value_0=17660`和`value_1=17530`，并不是运行时计算出来的。它们的设计尺度来自245.76 MHz处理时钟与61.44 MHz时域采样率的4倍关系：
+
+```text
+长CP符号：   (4096 + 320) × 4 = 4416 × 4 = 17664个处理时钟
+普通CP符号： (4096 + 288) × 4 = 4384 × 4 = 17536个处理时钟
+
+RTL实际值：
+17660 = 17664 - 4
+17530 = 17536 - 6
+```
+
+因此17660/17530可以理解为按理想4倍符号时长得到17664/17536后，源码又做了少量固定拍数调整。现有RTL和注释没有说明为何分别减4拍和6拍；可能用于补偿调度/流水边界或留固定裕量，但不能在没有仿真的情况下把这个原因当作已证实结论。应以源码常量作为实际调度值，并用`symbol_trigger`波形核实相邻启动沿确实相隔17660或17530拍。
+
+这也解释了“启动间隔”和“RAM读长度”为什么不同。模块在每个符号开始后只连续高速读4416/4384拍，读完后暂停，直到下一个17660/17530拍边界：
+
+```text
+长符号：   读4416拍 + 空闲13244拍 = 启动间隔17660拍
+普通符号： 读4384拍 + 空闲13146拍 = 启动间隔17530拍
+```
+
+前者决定下一次读突发什么时候开始，后者决定本次连续读多少个RAM样点。读窗口中`symbol_valid_out=1`，它既使`additional_index`逐点增加，也是后续频偏补偿数据valid的时间基准。
+
+另一个计数器只在读有效时累计0～61439，因为：
+
+```text
+2×4416 + 12×4384 = 61440点/子帧
+```
+
+每累计61440点产生一次`subframe_finished`，再统计第0子帧是否已经结束。
+
+### 初始频偏和跟踪频偏如何合并
+
+`Compensation_CFO_Calculation`在帧启动`trigger`时锁存`precise_Carrier_Frequency_offset`。每次`frequency_tracking_estimate_valid`到来时更新跟踪值。第0子帧期间只使用初始精频偏；第0子帧结束后打开`use_frequency_tracking`，总补偿步进为有符号二补码相加：
+
+```text
+sum_frequency = precise_CFO + enabled_tracking_CFO
+```
+
+新无线帧启动时先关闭上一帧的跟踪补偿，避免旧跟踪值污染新帧第0子帧。
+
+### carrier_frequency_shift如何逐点补偿
+
+频移模块用DDS生成`cosθ+j·sinθ`，再计算：
+
+```text
+(I+jQ) × (cosθ+j·sinθ)
+```
+
+`PINC=sum_frequency`是DDS每个有效采样的相位增量。输入无效时代码把`PINC_r`置0，因此DDS相位在符号突发间隙不前进；相位只按照实际读出的连续采样序号累积，不会把处理时钟空闲间隔误算为空口采样时间。
+
+DDS/PINC对齐约9拍，复数乘法器约6拍，最终饱和裁回C1.15再延迟1拍，总频移通路约16拍。父模块继续把数据和valid各延迟1拍作为最终输出，并从`output_valid`上升沿产生`output_valid_rising`。
+
+### 第一遍必须记住
+
+```text
+20480主RAM：连续写，不保存整帧，只作为时间对齐和速率转换缓存
+trigger：先锁存First_sample_index和初始频偏，再启动140个符号的读调度
+读地址：First_sample_index + 本帧已输出样本数，模20480
+读窗口：4416/4384点，仍含CP；CP由下一个模块删除
+频偏补偿：第0子帧用precise_cfo，之后可叠加frequency_tracking_estimate
+输出：已对齐、已补频偏，但仍包含CP的时域IQ
+```
+
 ## CP_Removal
 
 一句话：不改动样点数值，只修改有效窗口，屏蔽每个OFDM符号开头的CP，留下连续4096个正文采样。
 
+### 输入是什么
+
+| 输入 | 含义 |
+|---|---|
+| `data_in_real/imag` | 已完成帧对齐和频偏补偿、但仍带CP的16-bit时域复数采样 |
+| `input_valid` | 当前输入采样有效；每个符号连续有效4416或4384拍 |
+| `symbol_start_in` | 每个含CP符号有效窗口的第一拍脉冲 |
+
+长CP符号输入为`CP[0:319] + DATA[0:4095]`，共4416点；普通符号输入为`CP[0:287] + DATA[0:4095]`，共4384点。
+
+### 中间实际只做三步
+
+1. `symbol_start_in`每来一次，`counter`在1～7间循环，判断当前是一个slot的第一个符号还是其余符号。
+2. slot第一个符号选择320拍延迟链，其余6个符号选择288拍延迟链。延迟的是`input_valid`和`symbol_start_in`，不是整组IQ数据。
+3. IQ数据本身只固定延迟2拍；只有“当前输入仍有效”且“距符号起点已经过去CP长度”时，`output_valid`才为1。
+
 ```text
-slot内符号0：丢弃320点CP
-slot内符号1～6：丢弃288点CP
+一个slot：符号0    符号1    符号2 ... 符号6
+CP长度：    320      288      288        288
+
+长CP输入：  C0 C1 ... C319 | D0 D1 ........ D4095
+output_valid: 0  0 ...   0  |  1  1 ........     1
+有效输出：                   D0 D1 ........ D4095
 ```
 
-模块使用320/288位移位寄存器延迟valid和symbol_start；数据本身只延迟2拍。源文件部分注释仍残留160/144或2048点旧参数，应以当前RTL常量320/288和宏`FFT_LENGTH=4096`为准。
+所以“去CP”不是把CP从RAM里删除，而是告诉后级FFT：前320/288拍不要收，从正文`D0`开始连续接收4096拍。
+
+### 输出是什么
+
+| 输出 | 含义 |
+|---|---|
+| `data_out_real/imag` | 与输入数值相同、只增加2拍流水延迟的时域IQ |
+| `output_valid` | 每个符号仅连续拉高4096拍，对应去CP后的正文 |
+| `symbol_start_out` | 与第一个正文采样`D0`对齐的单拍脉冲 |
+
+这4096个有效点随后直接进入`FFT_All_Remain`，形成一个完整4096点FFT输入块。
+
+### 关键代码怎么读
+
+`counter`按每个slot的7个符号循环。复位后第一次`symbol_start_in`令其进入1，因此`counter==1`选择长CP 320；`counter==2~7`选择普通CP 288：
+
+```verilog
+counter <= (counter == `OFDM_SYMBOL_PER_SLOT) ? 3'd1
+                                                : counter + 1'b1;
+
+case(counter)
+    3'd0   : state <= WAIT_DATA;
+    3'd1   : state <= OUT_LENGTH_2; // 320
+    default: state <= OUT_LENGTH_1; // 288
+endcase
+```
+
+两组长移位寄存器只用于制造“CP时间已过去”的标志：
+
+```verilog
+SR1 <= {SR1[286:0], input_valid_delay2}; // 延迟288拍
+SR2 <= {SR2[318:0], input_valid_delay2}; // 延迟320拍
+```
+
+真正决定FFT是否接收当前IQ的是：
+
+```verilog
+output_valid = input_valid_delay2 & input_valid_delay;
+```
+
+前一项表示“当前数据仍处于本符号有效窗口”，后一项表示“符号开始已经过去一个CP长度”。二者相与后，4416点窗口变成`4416-320=4096`拍，4384点窗口变成`4384-288=4096`拍。
+
+### 为什么还要统一延迟2拍
+
+状态切换和输入寄存各需要流水对齐。代码把IQ、`input_valid`和`symbol_start_in`都先延迟2拍，再把valid/起点脉冲送入288/320拍延迟链，因此延迟链到点时，`data_out`恰好位于第一个正文采样，而不是CP末点或正文第二点。这一点从代码时序可推得，但最好在仿真中给每个输入样点编号，确认不存在边界偏一拍。
+
+### 第一遍必须记住
+
+```text
+CP_Removal不计算、不搬运、不重排IQ
+它只数当前是slot内第几个符号，并延迟valid门控
+320/288是CP长度，4096是保留下来的FFT正文长度
+输出数值仍是时域IQ，下一模块才做FFT
+```
+
+源文件部分注释仍残留160/144或2048点等旧参数，应以当前RTL常量320/288和宏`FFT_LENGTH=4096`为准。状态名`OUT_LENGTH_1/2`也容易误导：它表示当前选择哪一种CP长度，并不是在输出288/320点数据。
 
 ## FFT_All_Remain
 
@@ -502,7 +1102,21 @@ W_FFTshift预处理
 → 输出29-bit实部和29-bit虚部
 ```
 
-这一模块明确证明接收端确实执行4096点FFT。FFT IP配置`tvalid`固定为0，代码注释认为IP默认执行FFT而不是IFFT；后续需要核对XCI默认配置或仿真输出方向。
+这一模块明确证明接收端确实执行4096点FFT。FFT IP的配置通道`s_axis_config_tvalid`固定为0，数据通道`s_axis_data_tvalid`仍由`valid_shift`驱动；代码依赖IP的静态默认配置执行FFT而不是运行时发送配置字，后续可用仿真输出方向再次确认。
+
+### 讨论：FFT是否收满4096点才计算和输出
+
+当前`FFT_4096.xci`配置为固定4096点、`radix_4_burst_io`、自然顺序输出、非缩放定点FFT，不是`pipelined_streaming_io`连续流水架构。因此第一遍可以按三个阶段理解：
+
+```text
+Load：累计接收4096个被AXI握手接受的时域复数
+Compute：IP内部执行Radix-4蝶形运算
+Unload：m_axis_data_tvalid拉高，依次输出4096个自然顺序频域复数
+```
+
+它必须获得完整4096点帧后才能形成正确的全帧频谱，第一帧的频域结果不会随着第一个时域样本立即输出；4096点缓存和蝶形计算存储位于FFT IP内部，`FFT_All_Remain`外层没有再显式写一块4096深度RAM。严格来说IP按`s_axis_data_tvalid && s_axis_data_tready`计数“已接受样本”，不是简单数4096个时钟；输入valid若有空拍，装载阶段就相应延长。
+
+当前RTL将FFT的`s_axis_data_tready`悬空、`m_axis_data_tready`固定为1，并且没有使用`tlast`，依赖固定变换长度由IP自行每4096个接受样本划分一帧，也假设输入有效到来时IP始终ready。若IP在下一符号装载期间拉低ready，外层不会停止数据，存在丢样风险；该假设应通过仿真或ILA检查`tready`后再最终确认。
 
 ## DC_Position_Change
 
@@ -517,27 +1131,137 @@ W_FFTshift预处理
 
 ## RX_Pack_Data
 
-一句话：把两根天线逐拍并行的4个连续频率位置，重新变成天线优先的4个64-bit字，正好与发射端`TX_Unpack_Data`相反。
+一句话：把两根天线逐拍并行的4个连续频率位置做成4个64-bit字；这是形成RB优先数据流之前的一次局部`2天线×4位置`转置，正好与发射端`TX_Unpack_Data`相反。
 
-输入顺序：
+### 输入是什么
+
+每条`RX_RRH_Chain`处理两根天线。FFT和DC调整之后，每个有效拍同时送来这两根天线在同一个频率位置上的复数：
+
+| 输入 | 内容 |
+|---|---|
+| `data_in_0[31:0]` | 天线A当前子载波，`{imag[15:0], real[15:0]}` |
+| `data_in_1[31:0]` | 天线B同一子载波，`{imag[15:0], real[15:0]}` |
+| `data_in_valid` | 两个32-bit复数同时有效 |
+
+连续4个有效输入拍为：
 
 ```text
-拍0：[A(k0), B(k0)]
-拍1：[A(k1), B(k1)]
-拍2：[A(k2), B(k2)]
-拍3：[A(k3), B(k3)]
+时钟拍       data_in_0       data_in_1
+  0            A(k0)           B(k0)
+  1            A(k1)           B(k1)
+  2            A(k2)           B(k2)
+  3            A(k3)           B(k3)
 ```
 
-输出顺序：
+这里的`k0～k3`是4个连续FFT频率位置，不是4根天线，也不是一个完整RB；一个RB有12个子载波，因此可拆成3组这样的四子载波小块。
+
+### 中间实际做哪几步
 
 ```text
-拍0：A(k0), A(k1)
-拍1：A(k2), A(k3)
-拍2：B(k0), B(k1)
-拍3：B(k2), B(k3)
+两根天线×连续4拍
+        ↓ 各自4级移位寄存器
+A组128 bit = {A3,A2,A1,A0}
+B组128 bit = {B3,B2,B1,B0}
+        ↓ Pack_Subcarrier
+256 bit = {B组,A组}
+        ↓ 每次切出64 bit，连续输出4拍
 ```
 
-每个复数为32 bit，所以每拍输出64 bit。四条Chain并行，最终得到天线01、23、45、67四路相同格式的数据。
+1. 两套4级寄存器分别收集A、B天线的4个连续复数。寄存器只在`data_in_valid=1`时移位，所以中间即使有无效空拍，也不会把无效数据混入四点小块。
+2. `Mod_N_Indexer(N=4)`只数有效输入，每收到第4个复数位置产生一次`four_subcarrier_valid_ahead`。
+3. `four_subcarrier_0/1`分别形成两条128-bit天线数据；`Pack_Subcarrier`只增加1拍寄存，把它们拼成`{B组,A组}`共256 bit。
+4. `PULSE_TO_STROBE_U16(N=4)`把“一组256-bit已经准备好”的单拍脉冲展开成4拍，并用`index=0～3`依次选择4个64-bit切片。
+
+### 输出是什么
+
+逻辑输出顺序为：
+
+```text
+输出拍0：data_out[31:0]=A(k0)，data_out[63:32]=A(k1)
+输出拍1：data_out[31:0]=A(k2)，data_out[63:32]=A(k3)
+输出拍2：data_out[31:0]=B(k0)，data_out[63:32]=B(k1)
+输出拍3：data_out[31:0]=B(k2)，data_out[63:32]=B(k3)
+```
+
+每个复数32 bit，每拍输出两个复数，因此`data_out`为64 bit；`data_out_valid`连续拉高4拍。输入4拍共收到`2天线×4位置=8`个复数，输出4拍也发出8个复数，吞吐量没有改变。
+
+### 为什么需要这次重排
+
+FFT天然按频率位置逐拍输出，因此两根并行天线的数据顺序是：
+
+```text
+位置优先：(A0,B0) → (A1,B1) → (A2,B2) → (A3,B3)
+```
+
+`RX_Pack_Data`局部输出改成：
+
+```text
+小块内部：(A0,A1) → (A2,A3) → (B0,B1) → (B2,B3)
+```
+
+这还不能单独称为“天线优先”，因为模块没有RB计数器，只认识每4个有效频率位置。真正的全局顺序由后面的`RX_RRH_FIFO_Exchange`形成：
+
+```text
+RB0小块0(k0~k3)：天线0 → 1 → ... → 7，共16个U64
+RB0小块1(k4~k7)：天线0 → 1 → ... → 7，共16个U64
+RB0小块2(k8~k11)：天线0 → 1 → ... → 7，共16个U64
+                         ↓
+              RB0完成，共48个U64
+                         ↓
+                     再处理RB1
+```
+
+因此准确结论是：`RX_Pack_Data`做小块内的天线/位置转置，`RX_RRH_FIFO_Exchange`完成RB优先组织。模块确实把两条32-bit天线流复用成一条64-bit流，但输入总宽也是`2×32=64 bit/拍`，输入输出平均带宽相同。连续工作时，每4拍收一组，同时每4拍发一组；经过最初约8拍流水延迟后可以无缝持续输出。
+
+### 关键代码怎么读
+
+四级移位寄存器收集连续位置：
+
+```verilog
+data_in_0_latch1 <= data_in_0;
+data_in_0_latch2 <= data_in_0_latch1;
+data_in_0_latch3 <= data_in_0_latch2;
+data_in_0_latch4 <= data_in_0_latch3;
+```
+
+收齐后，`A(k0)`位于128-bit字的最低32位，`A(k3)`位于最高32位：
+
+```verilog
+four_subcarrier_0 <= {
+    data_in_0_latch1, // A(k3)
+    data_in_0_latch2, // A(k2)
+    data_in_0_latch3, // A(k1)
+    data_in_0_latch4  // A(k0)
+};
+```
+
+子模块`Pack_Subcarrier`没有复杂算法，只做一次拼接寄存：
+
+```verilog
+packed_subcarriers <= {subcarrier_stream1, subcarrier_stream0};
+```
+
+最后从低位开始依次切片，所以先输出A，再输出B：
+
+```verilog
+index=0: pack_out_latch[ 63:  0] // A0,A1
+index=1: pack_out_latch[127: 64] // A2,A3
+index=2: pack_out_latch[191:128] // B0,B1
+index=3: pack_out_latch[255:192] // B2,B3
+```
+
+### 第一遍必须记住
+
+```text
+输入：每拍两根天线的同一个子载波
+积累：连续4个子载波位置
+输出：先天线A的4点，再天线B的4点
+局部本质：两天线同位置并行 → 四位置小块内按天线成对输出
+全局本质：三个四位置小块组成一个完整RB，RB0完成后才进入RB1
+带宽：输入64 bit/拍，输出64 bit/拍，没有增加吞吐量
+```
+
+四条`RX_RRH_Chain`并行，最终形成天线0/1、2/3、4/5、6/7四路相同格式的数据。内部数据寄存器没有显式复位，复位后的内容可能为未知值，但正常设计依靠`data_out_valid=0`屏蔽首组形成前的数据；仍建议仿真检查首组valid和8拍延迟边界。
 
 ## 风险与待验证项
 
