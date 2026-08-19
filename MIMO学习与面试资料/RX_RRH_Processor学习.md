@@ -77,6 +77,8 @@ flowchart LR
 
 读图时把它分成三条线：粗实线是8天线主数据；上方同步支路只用天线4产生统一起点、初始频偏和四板启动触发；下方跟踪支路再从天线4的FFT结果估计残余频偏，并反馈给全部8根天线的`Align_output_with_CFO_compensation`。`RX_RRH_Processor`本身输出4条天线对流，完整RB优先顺序要到紧接着的`RX_RRH_FIFO_Exchange`才形成。
 
+这里的 `FFT_All_Remain → FFT_4096` 是主工程真正的接收OFDM FFT位置：每根天线把去CP后的4096个时域采样变为4096个频域点。后续 `RX_BIT_Processor → WFRFT_RX` 中虽然还包含另一套 `FFT_4096`，但那套只用于与发射端WFRFT配对恢复，不应称为第二次OFDM解调FFT。
+
 ### 图中`First_sample_index`、`precise_cfo`和`align_working_trigger`的关系
 
 这三根线组成同一帧的“两个参数＋一个启动脉冲”，但不是同一拍计算出来：

@@ -476,17 +476,19 @@ FPGA3：[L9,L10,L11]
 
 ```mermaid
 flowchart LR
-    A["TX BIT\n每板3 Layer"] --> B["TX_BIT_FIFO_Exchange\n汇聚12 Layer"]
+    A["TX BIT\n编码/调制/资源映射\nWFRFT_TX中完成IFFT等效变换"] --> B["TX_BIT_FIFO_Exchange\n汇聚12 Layer"]
     B --> C["TX_MIMO_Processor\n12 Layer → 32 TX天线"]
     C --> D["TX_RRH_FIFO_Exchange\n按天线分回各板"]
-    D --> E["TX RRH\nIFFT/CP/插值/射频"]
+    D --> E["TX RRH\nIFFT已旁路\n直通/CP/PSS/插值/射频"]
     E --> F["无线信道"]
     F --> G["RX RRH\n同步/频偏补偿/FFT"]
     G --> H["RX_RRH_FIFO_Exchange\n汇聚32 RX天线"]
     H --> I["RX_MIMO_Processor\n32 RX天线 → 12 Layer"]
     I --> J["RX_MIMO_Data_Processing/交换\n每板分回3 Layer"]
-    J --> K["RX BIT\n解调/译码"]
+    J --> K["RX BIT\nDC恢复/WFRFT逆配对\n资源解映射/解调/译码"]
 ```
+
+当前RTL中要把两类FFT区分开：发射OFDM IFFT等效分量位于 `Combine_Control_and_Data → WFRFT_TX`；接收OFDM FFT位于 `RX_RRH_Chain → FFT_All_Remain`。`TX_RRH_Chain` 已把原IFFT改成直通，只负责拆包、加CP和PSS选择。`RX_BIT_Processor → WFRFT_RX` 内部还有FFT IP，但用途是结合前级RRH FFT恢复WFRFT，不是另一遍天线时域转频域。
 
 ## 六、收发端关键数字总表
 

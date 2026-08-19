@@ -3951,6 +3951,25 @@ PDCCH_Transmitter_Top ---------- PDCCH I/Q ----/              |
 
 这些位置正是当前资源表中的RS符号。输出 `using_ifft` 回到父模块后再延迟10000拍；到WFRFT四路分量加权时，父模块用它把 `alpha` 强制为30，只选择IFFT分量。
 
+当前主工程的OFDM IFFT等效处理就在这里，而不在后面的 `TX_RRH_Chain`。`WFRFT_TX` 内只实例化一套 `Normalization_FFT_wo_shift → FFT_4096`，再用原输入和RAM正序/反序读取构造：
+
+```text
+X0 = x
+X1 = F·x
+X2 = F²·x
+X3 = F³·x = F⁻¹·x（忽略定点缩放差异，即IFFT分量）
+```
+
+当前真正生效的系数表只有三种选择：
+
+| `WFRFT_TX.alpha` | 选中的分量 | 当前含义 |
+|---:|---|---|
+| `10` | `X1` | 4096点FFT分量 |
+| `30` | `X3` | 4096点IFFT等效分量 |
+| 其他 | `X0` | 直通分量 |
+
+所以普通IFFT路径为 `4096点频域资源网格 → WFRFT_TX(alpha=30) → 4096点待加CP采样`。模块输出名 `FFT_valid/FFT_symbol_*` 只是历史命名，不代表它始终执行FFT。
+
 ##### 3. `TX_Resource_Mapper_Top`：产生每个频域位置的类型标签
 
 输入是 `start_of_symbol`；输出并不是实际I/Q，而是一组控制标签：
